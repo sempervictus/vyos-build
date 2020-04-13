@@ -33,6 +33,7 @@ def getGitRepoName() {
 // Returns false if this is build from git@github.com:vyos/<reponame>.
 // <reponame> can be e.g. vyos-1x.git or vyatta-op.git
 def isCustomBuild() {
+    return true
     // GitHub organisation base URL
     def gitURI = 'git@github.com:vyos/' + getGitRepoName()
     def httpURI = 'https://github.com/vyos/' + getGitRepoName()
@@ -172,6 +173,7 @@ pipeline {
 
                     sh './configure --build-by jenkins@svit.local --architecture amd64 --custom-package vim --debian-mirror http://ftp.us.debian.org/debian/'
                     sh 'sudo make openstack'
+                    sh 'sudo chmod -R 777 build/'
                 }
             } } }
         }
@@ -181,6 +183,7 @@ pipeline {
                     sh 'sudo make clean'
                     sh './configure --build-by jenkins@svit.local --architecture armhf --custom-package vim --debian-mirror http://ftp.us.debian.org/debian/'
                     sh 'sudo make qemu'
+                    sh 'sudo chmod -R 777 build/'
                 }
             } } }
         }
@@ -188,6 +191,7 @@ pipeline {
             steps { timestamps { logstash {
                 sh """
                     sudo make test
+                    sudo chmod -R 777 build/
                 """
             } } }
         }
@@ -242,12 +246,12 @@ pipeline {
             echo 'One way or another, I have finished'
             // the 'build' directory got elevated permissions during the build
             // cdjust permissions so it can be cleaned up by the regular user
-            sh '''
-                #!/bin/bash
-                if [ -d build ]; then
-                    sudo chmod -R 777 build/
-                fi
-            '''
+            // sh '''
+            //     #!/bin/bash
+            //     if [ -d build ]; then
+            //         sudo chmod -R 777 build/
+            //     fi
+            // '''
             deleteDir() /* cleanup our workspace */
         } } }
     }
