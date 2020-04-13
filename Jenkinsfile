@@ -160,7 +160,7 @@ pipeline {
         dockerfile {
             filename 'Dockerfile'
             dir 'docker'
-            args '--privileged --sysctl net.ipv6.conf.lo.disable_ipv6=0 -e GOSU_UID=1006 -e GOSU_GID=1006'
+            args '--privileged --rm -it --sysctl net.ipv6.conf.lo.disable_ipv6=0 -v "$(dirname $PWD)":/vyos -w /vyos'
         }
     }
     stages {
@@ -170,7 +170,7 @@ pipeline {
                     def commitId = sh(returnStdout: true, script: 'git rev-parse --short=11 HEAD').trim()
                     currentBuild.description = sprintf('Git SHA1: %s', commitId[-11..-1])
 
-                    sh './configure --build-by autobuild@vyos.net --debian-mirror http://ftp.us.debian.org/debian/'
+                    sh './configure --build-by jenkins@svit.local --custom-package vim --debian-mirror http://ftp.us.debian.org/debian/'
                     sh 'sudo make iso'
                 }
             }
