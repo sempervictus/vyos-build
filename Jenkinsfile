@@ -146,25 +146,25 @@ node('Docker') {
 }
 
 pipeline {
+    options {
+        skipDefaultCheckout()
+        disableConcurrentBuilds()
+        timeout(time: 120, unit: 'MINUTES')
+        parallelsAlwaysFailFast()
+        timestamps()
+    }
+    triggers {
+        cron('H 2 * * *')
+    }
+    agent {
+        dockerfile {
+            filename 'Dockerfile'
+            dir 'docker'
+            args '--privileged '
+        }
+    }
     timestamps {
         logstash {
-            options {
-                skipDefaultCheckout()
-                disableConcurrentBuilds()
-                timeout(time: 120, unit: 'MINUTES')
-                parallelsAlwaysFailFast()
-                timestamps()
-            }
-            triggers {
-                cron('H 2 * * *')
-            }
-            agent {
-                dockerfile {
-                    filename 'Dockerfile'
-                    dir 'docker'
-                    args '--privileged '
-                }
-            }
             stages {
                 stage('Build ISO amd64') {
                     steps {
