@@ -157,11 +157,11 @@ pipeline {
         cron('H 2 * * *')
     }
     agent {
-        dockerfile { timestamps { logstash {
+        dockerfile {
             filename 'Dockerfile'
             dir 'docker'
             args '--privileged '
-        } } }
+        }
     }
     stages { 
         stage('Build ISO amd64') {
