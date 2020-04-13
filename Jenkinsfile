@@ -173,7 +173,7 @@ timestamps {
                             currentBuild.description = sprintf('Git SHA1: %s', commitId[-11..-1])
 
                             sh './configure --build-by jenkins@svit.local --architecture amd64 --custom-package vim --debian-mirror http://ftp.us.debian.org/debian/'
-                            sh 'sudo make iso'
+                            sh 'sudo make openstack'
                         }
                     }
                 }
