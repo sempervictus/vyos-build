@@ -156,16 +156,16 @@ pipeline {
     triggers {
         cron('H 2 * * *')
     }
-    agent { 
+    agent {
         dockerfile { timestamps { logstash {
             filename 'Dockerfile'
             dir 'docker'
             args '--privileged '
         } } }
     }
-    stages { timestamps { logstash {
+    stages { 
         stage('Build ISO amd64') {
-            steps {
+            steps {  timestamps { logstash {
                 script {
                     def commitId = sh(returnStdout: true, script: 'git rev-parse --short=11 HEAD').trim()
                     currentBuild.description = sprintf('Git SHA1: %s', commitId[-11..-1])
@@ -173,27 +173,27 @@ pipeline {
                     sh './configure --build-by jenkins@svit.local --architecture amd64 --custom-package vim --debian-mirror http://ftp.us.debian.org/debian/'
                     sh 'sudo make openstack'
                 }
-            }
+            } } }
         }
         stage('Build ISO armhf') {
-            steps {
+            steps { timestamps { logstash {
                 script {
                     sh 'sudo make clean'
                     sh './configure --build-by jenkins@svit.local --architecture armhf --custom-package vim --debian-mirror http://ftp.us.debian.org/debian/'
                     sh 'sudo make qemu'
                 }
-            }
+            } } }
         }
         stage('Test ISO') {
-            steps {
+            steps { timestamps { logstash {
                 sh """
                     sudo make test
                 """
-            }
+            } } }
         }
-    } } }
+    }
     post {
-        success {
+        success { timestamps { logstash {
             script {
                 // only deploy ISO if build from official repository
                 if (isCustomBuild())
@@ -233,11 +233,11 @@ pipeline {
     
                 }
             }
-        }
-        failure {
+        } } }
+        failure { timestamps { logstash {
             archiveArtifacts artifacts: '**/live-image-amd64.hybrid.iso',
                 allowEmptyArchive: true
-        }
+        } } }
         cleanup { timestamps { logstash {
             echo 'One way or another, I have finished'
             // the 'build' directory got elevated permissions during the build
