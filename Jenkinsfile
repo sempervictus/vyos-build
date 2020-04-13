@@ -145,110 +145,114 @@ node('Docker') {
     }
 }
 
-pipeline {
-    options {
-        skipDefaultCheckout()
-        disableConcurrentBuilds()
-        timeout(time: 120, unit: 'MINUTES')
-        parallelsAlwaysFailFast()
-        timestamps()
-    }
-    triggers {
-        cron('H 2 * * *')
-    }
-    agent {
-        dockerfile {
-            filename 'Dockerfile'
-            dir 'docker'
-            args '--privileged '
-        }
-    }
-    stages {
-        stage('Build ISO amd64') {
-            steps {
-                script {
-                    def commitId = sh(returnStdout: true, script: 'git rev-parse --short=11 HEAD').trim()
-                    currentBuild.description = sprintf('Git SHA1: %s', commitId[-11..-1])
-
-                    sh './configure --build-by jenkins@svit.local --architecture amd64 --custom-package vim --debian-mirror http://ftp.us.debian.org/debian/'
-                    sh 'sudo make iso'
+timestamps {
+    logstash {
+        pipeline {
+            options {
+                skipDefaultCheckout()
+                disableConcurrentBuilds()
+                timeout(time: 120, unit: 'MINUTES')
+                parallelsAlwaysFailFast()
+                timestamps()
+            }
+            triggers {
+                cron('H 2 * * *')
+            }
+            agent {
+                dockerfile {
+                    filename 'Dockerfile'
+                    dir 'docker'
+                    args '--privileged '
                 }
             }
-        }
-        // stage('Build ISO armhf') {
-        //     steps {
-        //         script {
-        //             sh 'sudo make clean'
-        //             sh './configure --build-by jenkins@svit.local --architecture armhf --custom-package vim --debian-mirror http://ftp.us.debian.org/debian/'
-        //             sh 'sudo make iso'
-        //         }
-        //     }
-        // }
-        stage('Test ISO') {
-            steps {
-                sh """
-                    sudo make test
-                """
-            }
-        }
-    }
-    post {
-        success {
-            script {
-                // only deploy ISO if build from official repository
-                if (isCustomBuild())
-                    return
+            stages {
+                stage('Build ISO amd64') {
+                    steps {
+                        script {
+                            def commitId = sh(returnStdout: true, script: 'git rev-parse --short=11 HEAD').trim()
+                            currentBuild.description = sprintf('Git SHA1: %s', commitId[-11..-1])
 
-                // publish build result, using SSH-dev.packages.vyos.net Jenkins Credentials
-                sshagent(['SSH-dev.packages.vyos.net']) {
-                    // build up some fancy groovy variables so we do not need to write/copy
-                    // every option over and over again!
-                    def ARCH = sh(returnStdout: true, script: "dpkg --print-architecture").trim()
-                    def SSH_DIR = '/home/sentrium/web/downloads.vyos.io/public_html/rolling/' + getGitBranchName() + '/' + ARCH
-                    def SSH_OPTS = '-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no'
-                    def SSH_REMOTE = 'khagen@10.217.48.113'
-
-                    // No need to explicitly check the return code. The pipeline
-                    // will fail if sh returns a non 0 exit code
-                    sh """
-                        ssh ${SSH_OPTS} ${SSH_REMOTE} -t "bash --login -c 'mkdir -p ${SSH_DIR}'"
-                    """
-                    sh """
-                        ssh ${SSH_OPTS} ${SSH_REMOTE} -t "bash --login -c 'mkdir -p ${SSH_DIR}'"
-                    """
-                    sh """
-                        ssh ${SSH_OPTS} ${SSH_REMOTE} -t "bash --login -c 'find ${SSH_DIR} -type f -mtime +14 -exec rm -f {} \\;'"
-                    """
-                    sh """
-                        scp ${SSH_OPTS} build/vyos*.iso ${SSH_REMOTE}:${SSH_DIR}/
-                    """
-                    sh """
-                        ssh ${SSH_OPTS} ${SSH_REMOTE} -t "bash --login -c '/usr/bin/make-latest-rolling-symlink.sh'"
-                    """
+                            sh './configure --build-by jenkins@svit.local --architecture amd64 --custom-package vim --debian-mirror http://ftp.us.debian.org/debian/'
+                            sh 'sudo make iso'
+                        }
+                    }
                 }
-                //upload to S3
-                withAWS(region: 'us-east-1', credentials: 's3-vyos-downloads-rolling-rw') {
-                    def ARCH = sh(returnStdout: true, script: "dpkg --print-architecture").trim()
-                    s3Upload( bucket: 'vyos-downloads-rolling', path: 'rolling/' + getGitBranchName() + '/' + ARCH+ '/', workingDir:'build', includePathPattern: 'vyos*.iso' )
-    
+                // stage('Build ISO armhf') {
+                //     steps {
+                //         script {
+                //             sh 'sudo make clean'
+                //             sh './configure --build-by jenkins@svit.local --architecture armhf --custom-package vim --debian-mirror http://ftp.us.debian.org/debian/'
+                //             sh 'sudo make iso'
+                //         }
+                //     }
+                // }
+                stage('Test ISO') {
+                    steps {
+                        sh """
+                            sudo make test
+                        """
+                    }
                 }
             }
-        }
-        failure {
-            archiveArtifacts artifacts: '**/live-image-amd64.hybrid.iso',
-                allowEmptyArchive: true
-        }
-        cleanup {
-            echo 'One way or another, I have finished'
-            // the 'build' directory got elevated permissions during the build
-            // cdjust permissions so it can be cleaned up by the regular user
-            sh '''
-                #!/bin/bash
-                if [ -d build ]; then
-                    sudo chmod -R 777 build/
-                fi
-            '''
-            deleteDir() /* cleanup our workspace */
+            post {
+                success {
+                    script {
+                        // only deploy ISO if build from official repository
+                        if (isCustomBuild())
+                            return
+
+                        // publish build result, using SSH-dev.packages.vyos.net Jenkins Credentials
+                        sshagent(['SSH-dev.packages.vyos.net']) {
+                            // build up some fancy groovy variables so we do not need to write/copy
+                            // every option over and over again!
+                            def ARCH = sh(returnStdout: true, script: "dpkg --print-architecture").trim()
+                            def SSH_DIR = '/home/sentrium/web/downloads.vyos.io/public_html/rolling/' + getGitBranchName() + '/' + ARCH
+                            def SSH_OPTS = '-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no'
+                            def SSH_REMOTE = 'khagen@10.217.48.113'
+
+                            // No need to explicitly check the return code. The pipeline
+                            // will fail if sh returns a non 0 exit code
+                            sh """
+                                ssh ${SSH_OPTS} ${SSH_REMOTE} -t "bash --login -c 'mkdir -p ${SSH_DIR}'"
+                            """
+                            sh """
+                                ssh ${SSH_OPTS} ${SSH_REMOTE} -t "bash --login -c 'mkdir -p ${SSH_DIR}'"
+                            """
+                            sh """
+                                ssh ${SSH_OPTS} ${SSH_REMOTE} -t "bash --login -c 'find ${SSH_DIR} -type f -mtime +14 -exec rm -f {} \\;'"
+                            """
+                            sh """
+                                scp ${SSH_OPTS} build/vyos*.iso ${SSH_REMOTE}:${SSH_DIR}/
+                            """
+                            sh """
+                                ssh ${SSH_OPTS} ${SSH_REMOTE} -t "bash --login -c '/usr/bin/make-latest-rolling-symlink.sh'"
+                            """
+                        }
+                        //upload to S3
+                        withAWS(region: 'us-east-1', credentials: 's3-vyos-downloads-rolling-rw') {
+                            def ARCH = sh(returnStdout: true, script: "dpkg --print-architecture").trim()
+                            s3Upload( bucket: 'vyos-downloads-rolling', path: 'rolling/' + getGitBranchName() + '/' + ARCH+ '/', workingDir:'build', includePathPattern: 'vyos*.iso' )
+            
+                        }
+                    }
+                }
+                failure {
+                    archiveArtifacts artifacts: '**/live-image-amd64.hybrid.iso',
+                        allowEmptyArchive: true
+                }
+                cleanup {
+                    echo 'One way or another, I have finished'
+                    // the 'build' directory got elevated permissions during the build
+                    // cdjust permissions so it can be cleaned up by the regular user
+                    sh '''
+                        #!/bin/bash
+                        if [ -d build ]; then
+                            sudo chmod -R 777 build/
+                        fi
+                    '''
+                    deleteDir() /* cleanup our workspace */
+                }
+            }
         }
     }
 }
