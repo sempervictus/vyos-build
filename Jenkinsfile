@@ -160,7 +160,7 @@ pipeline {
         dockerfile {
             filename 'Dockerfile'
             dir 'docker'
-            args '--privileged --rm -it --sysctl net.ipv6.conf.lo.disable_ipv6=0 -v "$(dirname $PWD)":/vyos -w /vyos'
+            args '--privileged '
         }
     }
     stages {
