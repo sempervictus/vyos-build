@@ -177,16 +177,16 @@ pipeline {
                 }
             } } }
         }
-        stage('Build ISO armhf') {
-            steps { timestamps { logstash {
-                script {
-                    sh 'sudo make clean'
-                    sh './configure --build-by jenkins@svit.local --architecture armhf --custom-package vim --debian-mirror http://ftp.us.debian.org/debian/'
-                    sh 'sudo make qemu'
-                    sh 'sudo chmod -R 777 build/'
-                }
-            } } }
-        }
+        // stage('Build ISO armhf') {
+        //     steps { timestamps { logstash {
+        //         script {
+        //             sh 'sudo make clean'
+        //             sh './configure --build-by jenkins@svit.local --architecture armhf --custom-package vim --debian-mirror http://ftp.us.debian.org/debian/'
+        //             sh 'sudo make qemu'
+        //             sh 'sudo chmod -R 777 build/'
+        //         }
+        //     } } }
+        // }
         stage('Test ISO') {
             steps { timestamps { logstash {
                 sh """
