@@ -164,17 +164,26 @@ pipeline {
         }
     }
     stages {
-        stage('Build ISO') {
+        stage('Build ISO amd64') {
             steps {
                 script {
                     def commitId = sh(returnStdout: true, script: 'git rev-parse --short=11 HEAD').trim()
                     currentBuild.description = sprintf('Git SHA1: %s', commitId[-11..-1])
 
-                    sh './configure --build-by jenkins@svit.local --custom-package vim --debian-mirror http://ftp.us.debian.org/debian/'
+                    sh './configure --build-by jenkins@svit.local --architecture amd64 --custom-package vim --debian-mirror http://ftp.us.debian.org/debian/'
                     sh 'sudo make iso'
                 }
             }
         }
+        // stage('Build ISO armhf') {
+        //     steps {
+        //         script {
+        //             sh 'sudo make clean'
+        //             sh './configure --build-by jenkins@svit.local --architecture armhf --custom-package vim --debian-mirror http://ftp.us.debian.org/debian/'
+        //             sh 'sudo make iso'
+        //         }
+        //     }
+        // }
         stage('Test ISO') {
             steps {
                 sh """
