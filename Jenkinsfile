@@ -145,9 +145,9 @@ node('Docker') {
     }
 }
 
-timestamps {
-    logstash {
-        pipeline {
+pipeline {
+    timestamps {
+        logstash {
             options {
                 skipDefaultCheckout()
                 disableConcurrentBuilds()
@@ -177,15 +177,15 @@ timestamps {
                         }
                     }
                 }
-                // stage('Build ISO armhf') {
-                //     steps {
-                //         script {
-                //             sh 'sudo make clean'
-                //             sh './configure --build-by jenkins@svit.local --architecture armhf --custom-package vim --debian-mirror http://ftp.us.debian.org/debian/'
-                //             sh 'sudo make iso'
-                //         }
-                //     }
-                // }
+                stage('Build ISO armhf') {
+                    steps {
+                        script {
+                            sh 'sudo make clean'
+                            sh './configure --build-by jenkins@svit.local --architecture armhf --custom-package vim --debian-mirror http://ftp.us.debian.org/debian/'
+                            sh 'sudo make qemu'
+                        }
+                    }
+                }
                 stage('Test ISO') {
                     steps {
                         sh """
