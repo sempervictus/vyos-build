@@ -187,14 +187,14 @@ pipeline {
         //         }
         //     } } }
         // }
-        stage('Test ISO') {
-            steps { timestamps { logstash {
-                sh """
-                    sudo make test
-                    sudo chmod -R 777 build/
-                """
-            } } }
-        }
+        // stage('Test ISO') {
+        //     steps { timestamps { logstash {
+        //         sh """
+        //             sudo make test
+        //             sudo chmod -R 777 build/
+        //         """
+        //     } } }
+        // }
     }
     post {
         success { timestamps { logstash {
