@@ -200,8 +200,10 @@ pipeline {
         success { timestamps { logstash {
             script {
                 // only deploy ISO if build from official repository
-                if (isCustomBuild())
+                if (isCustomBuild()) {
+                    archiveArtifacts artifacts: '**/live-image-amd64.hybrid.iso', allowEmptyArchive: true
                     return
+                }
 
                 // publish build result, using SSH-dev.packages.vyos.net Jenkins Credentials
                 sshagent(['SSH-dev.packages.vyos.net']) {
