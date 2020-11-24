@@ -88,21 +88,13 @@ pipeline {
                         }
                     }
                     steps {
-                        script {
-                            dir(env.BASE_DIR) {
-                                sh '''
-                                    KERNEL_VER=\$(cat ../../data/defaults.json | jq -r .kernel_version)
-                                    gpg2 --locate-keys torvalds@kernel.org gregkh@kernel.org
-                                    curl -OL https://www.kernel.org/pub/linux/kernel/v5.x/linux-${KERNEL_VER}.tar.xz
-                                    curl -OL https://www.kernel.org/pub/linux/kernel/v5.x/linux-${KERNEL_VER}.tar.sign
-                                    xz -cd linux-${KERNEL_VER}.tar.xz | gpg2 --verify linux-${KERNEL_VER}.tar.sign -
-                                    if [ $? -ne 0 ]; then
-                                        exit 1
-                                    fi
-                                    tar xf linux-${KERNEL_VER}.tar.xz
-                                    ln -s linux-${KERNEL_VER} linux
-                                '''
-                            }
+                        dir(env.BASE_DIR + '/linux') {
+                            checkout([$class: 'GitSCM',
+                                doGenerateSubmoduleConfigurations: false,
+                                extensions: [[$class: 'CleanCheckout'],
+                                             [$class: 'CloneOption', depth: 1, noTags: false, reference: '', shallow: true]],
+                                branches: [[name: 'v5.10.15' ]],
+                                userRemoteConfigs: [[credentialsId: 'GitHub-vyosbot', url: 'https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git']]])
                         }
                     }
                 }
@@ -123,29 +115,8 @@ pipeline {
                                 doGenerateSubmoduleConfigurations: false,
                                 extensions: [[$class: 'CleanCheckout'],
                                              [$class: 'CloneOption', depth: 1, noTags: false, reference: '', shallow: true]],
-                                branches: [[name: '20201218' ]],
+                                branches: [[name: '20201022' ]],
                                 userRemoteConfigs: [[credentialsId: 'GitHub-vyosbot', url: 'https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git']]])
-                        }
-                    }
-                }
-                stage('Accel-PPP') {
-                    when {
-                        beforeOptions true
-                        beforeAgent true
-                        anyOf {
-                            changeset pattern: "${env.CHANGESET_DIR}"
-                            changeset pattern: "**/data/defaults.json"
-                            triggeredBy 'TimerTrigger'
-                            triggeredBy cause: "UserIdCause"
-                        }
-                    }
-                    steps {
-                        dir(env.BASE_DIR + '/accel-ppp') {
-                            checkout([$class: 'GitSCM',
-                                doGenerateSubmoduleConfigurations: false,
-                                extensions: [[$class: 'CleanCheckout']],
-                                branches: [[name: '59f8e1bc3f199c8d0d985253e19a74ad87130179' ]],
-                                userRemoteConfigs: [[credentialsId: 'GitHub-vyosbot', url: 'https://github.com/accel-ppp/accel-ppp.git']]])
                         }
                     }
                 }
@@ -169,44 +140,6 @@ pipeline {
             }
         }
 
-        stage('Kernel Module(s)') {
-            parallel {
-                stage('Accel-PPP') {
-                    when {
-                        beforeOptions true
-                        beforeAgent true
-                        anyOf {
-                            changeset pattern: "${env.CHANGESET_DIR}"
-                            changeset pattern: "**/data/defaults.json"
-                            triggeredBy 'TimerTrigger'
-                            triggeredBy cause: "UserIdCause"
-                        }
-                    }
-                    steps {
-                        dir(env.BASE_DIR) {
-                            sh "./build-accel-ppp.sh"
-                        }
-                    }
-                }
-                stage('Intel QuickAssist Technology') {
-                    when {
-                        beforeOptions true
-                        beforeAgent true
-                        anyOf {
-                            changeset pattern: "${env.CHANGESET_DIR}"
-                            changeset pattern: "**/data/defaults.json"
-                            triggeredBy 'TimerTrigger'
-                            triggeredBy cause: "UserIdCause"
-                        }
-                    }
-                    steps {
-                        dir(env.BASE_DIR) {
-                            sh "./build-intel-qat.sh"
-                        }
-                    }
-                }
-            }
-        }
         // This stage should not be run in the parallel section as it will call "make"
         // again on the kernel source and this could confuse other build systems
         // like generating Intel or Accel-PPP drivers. Better safe then sorry!

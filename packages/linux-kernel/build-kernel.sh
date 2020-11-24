@@ -18,12 +18,13 @@ git reset --hard HEAD
 KERNEL_VERSION=$(make kernelversion)
 KERNEL_SUFFIX=-$(dpkg --print-architecture)-vyos
 
-# VyOS requires some small Kernel Patches - apply them here
-# It's easier to habe them here and make use of the upstream
-# repository instead of maintaining a full Kernel Fork.
+# VyOS builds added functionality from Kernel Patches - apply 
+# them here.
+# It's easier to have them here and make use of the upstream
+# repository instead of maintaining a full Kernel fork.
 # Saving time/resources is essential :-)
 PATCH_DIR=${CWD}/patches/kernel
-for patch in $(ls ${PATCH_DIR})
+for patch in $(ls ${PATCH_DIR} | grep -v rsbac)
 do
     echo "I: Apply Kernel patch: ${PATCH_DIR}/${patch}"
     patch -p1 < ${PATCH_DIR}/${patch}

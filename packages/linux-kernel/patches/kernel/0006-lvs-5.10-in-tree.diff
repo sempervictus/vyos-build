@@ -1,0 +1,2116 @@
+commit 820e46d0d0e044e9d3067075ac7bd0b1b0e0041a
+Author: RageLtMan <rageltman [at] sempervictus>
+Date:   Tue Dec 8 02:33:18 2020 -0500
+
+    LVS for Hardened 5.9 20201020
+
+diff --git a/Documentation/networking/ip-sysctl.rst b/Documentation/networking/ip-sysctl.rst
+index 76f1892d65ed..259cbbd4b7df 100644
+--- a/Documentation/networking/ip-sysctl.rst
++++ b/Documentation/networking/ip-sysctl.rst
+@@ -1312,6 +1312,19 @@ forwarding - BOOLEAN
+ 	Enable IP forwarding on this interface.  This controls whether packets
+ 	received _on_ this interface can be forwarded.
+ 
++forward_shared - BOOLEAN
++	Integer value determines if a source validation should allow
++	forwarding of packets with local source address. 1 means yes,
++	0 means no. By default the flag is disabled and such packets
++	are not forwarded.
++ 
++	If you enable this flag on internal network, the router will forward
++	packets from internal hosts with shared IP addresses no matter how
++	the rp_filter is set. This flag is activated only if it is
++	enabled both in specific device section and in "all" section.
++
++	The forward_shared value could be ignored when rp_filter is set to 0.
++
+ mc_forwarding - BOOLEAN
+ 	Do multicast routing. The kernel needs to be compiled with CONFIG_MROUTE
+ 	and a multicast routing daemon is required.
+@@ -1443,6 +1456,15 @@ rp_filter - INTEGER
+ 	Default value is 0. Note that some distributions enable it
+ 	in startup scripts.
+ 
++rp_filter_mask - INTEGER
++	Integer value representing bitmask of the mediums for which the
++	reverse path protection is disabled. If the source validation
++	results in reverse path to interface with medium_id value in
++	the 1..31 range the access is allowed if the corresponding bit
++	is set in the bitmask. The bitmask value is considered only when
++	rp_filter is enabled. By default the bitmask is empty preserving
++	the original rp_filter semantic.
++
+ arp_filter - BOOLEAN
+ 	- 1 - Allows you to have multiple network interfaces on the same
+ 	  subnet, and have the ARPs for each interface be answered
+@@ -1594,6 +1616,14 @@ drop_gratuitous_arp - BOOLEAN
+ 	Default: off (0)
+ 
+ 
++hidden - BOOLEAN
++	Hide addresses attached to this device from other devices.
++	Such addresses will never be selected by source address autoselection
++	mechanism, host does not answer broadcast ARP requests for them,
++	does not announce them as source address of ARP requests, but they
++	are still reachable via IP. This flag is activated only if it is
++	enabled both in specific device section and in "all" section.
++
+ tag - INTEGER
+ 	Allows you to write a number, which can be used as required.
+ 
+diff --git a/include/linux/inetdevice.h b/include/linux/inetdevice.h
+index 3515ca64e638..d859a561ad61 100644
+--- a/include/linux/inetdevice.h
++++ b/include/linux/inetdevice.h
+@@ -97,9 +97,11 @@ static inline void ipv4_devconf_setall(struct in_device *in_dev)
+ #define IN_DEV_MFORWARD(in_dev)		IN_DEV_ANDCONF((in_dev), MC_FORWARDING)
+ #define IN_DEV_BFORWARD(in_dev)		IN_DEV_ANDCONF((in_dev), BC_FORWARDING)
+ #define IN_DEV_RPFILTER(in_dev)		IN_DEV_MAXCONF((in_dev), RP_FILTER)
++#define IN_DEV_RPFILTER_MASK(in_dev)	IN_DEV_CONF_GET(in_dev, RP_FILTER_MASK)
+ #define IN_DEV_SRC_VMARK(in_dev)    	IN_DEV_ORCONF((in_dev), SRC_VMARK)
+ #define IN_DEV_SOURCE_ROUTE(in_dev)	IN_DEV_ANDCONF((in_dev), \
+ 						       ACCEPT_SOURCE_ROUTE)
++#define IN_DEV_FORWARD_SHARED(in_dev)	IN_DEV_ANDCONF((in_dev), FORWARD_SHARED)
+ #define IN_DEV_ACCEPT_LOCAL(in_dev)	IN_DEV_ORCONF((in_dev), ACCEPT_LOCAL)
+ #define IN_DEV_BOOTP_RELAY(in_dev)	IN_DEV_ANDCONF((in_dev), BOOTP_RELAY)
+ 
+@@ -112,6 +114,7 @@ static inline void ipv4_devconf_setall(struct in_device *in_dev)
+ 						      SECURE_REDIRECTS)
+ #define IN_DEV_IDTAG(in_dev)		IN_DEV_CONF_GET(in_dev, TAG)
+ #define IN_DEV_MEDIUM_ID(in_dev)	IN_DEV_CONF_GET(in_dev, MEDIUM_ID)
++#define IN_DEV_HIDDEN(in_dev)		IN_DEV_ANDCONF((in_dev), HIDDEN)
+ #define IN_DEV_PROMOTE_SECONDARIES(in_dev) \
+ 					IN_DEV_ORCONF((in_dev), \
+ 						      PROMOTE_SECONDARIES)
+diff --git a/include/net/flow.h b/include/net/flow.h
+index b2531df3f65f..8e47067e83aa 100644
+--- a/include/net/flow.h
++++ b/include/net/flow.h
+@@ -93,6 +93,7 @@ struct flowi4 {
+ #define fl4_ipsec_spi		uli.spi
+ #define fl4_mh_type		uli.mht.type
+ #define fl4_gre_key		uli.gre_key
++	__be32			fl4_gw;
+ } __attribute__((__aligned__(BITS_PER_LONG/8)));
+ 
+ static inline void flowi4_init_output(struct flowi4 *fl4, int oif,
+@@ -117,6 +118,7 @@ static inline void flowi4_init_output(struct flowi4 *fl4, int oif,
+ 	fl4->fl4_dport = dport;
+ 	fl4->fl4_sport = sport;
+ 	fl4->flowi4_multipath_hash = 0;
++	fl4->fl4_gw = 0;
+ }
+ 
+ /* Reset some input parameters after previous lookup */
+diff --git a/include/net/ip_fib.h b/include/net/ip_fib.h
+index 2ec062aaa978..6fd01305bb68 100644
+--- a/include/net/ip_fib.h
++++ b/include/net/ip_fib.h
+@@ -422,6 +422,8 @@ static inline bool fib4_rules_early_flow_dissect(struct net *net,
+ 	return true;
+ }
+ 
++u32 fib_result_table(struct fib_result *res);
++
+ #endif /* CONFIG_IP_MULTIPLE_TABLES */
+ 
+ /* Exported by fib_frontend.c */
+@@ -433,7 +435,8 @@ __be32 fib_compute_spec_dst(struct sk_buff *skb);
+ bool fib_info_nh_uses_dev(struct fib_info *fi, const struct net_device *dev);
+ int fib_validate_source(struct sk_buff *skb, __be32 src, __be32 dst,
+ 			u8 tos, int oif, struct net_device *dev,
+-			struct in_device *idev, u32 *itag);
++			struct in_device *idev, u32 *itag, int our);
++void fib_select_default(const struct flowi4 *flp, struct fib_result *res);
+ #ifdef CONFIG_IP_ROUTE_CLASSID
+ static inline int fib_num_tclassid_users(struct net *net)
+ {
+diff --git a/include/net/netfilter/nf_nat.h b/include/net/netfilter/nf_nat.h
+index 0d412dd63707..f465b617aac7 100644
+--- a/include/net/netfilter/nf_nat.h
++++ b/include/net/netfilter/nf_nat.h
+@@ -35,6 +35,11 @@ struct nf_conn_nat {
+ #endif
+ };
+ 
++/* Call input routing for SNAT-ed traffic */
++unsigned int ip_nat_route_input(void *priv,
++				struct sk_buff *skb,
++				const struct nf_hook_state *state);
++
+ /* Set up the info structure to map into this range. */
+ unsigned int nf_nat_setup_info(struct nf_conn *ct,
+ 			       const struct nf_nat_range2 *range,
+diff --git a/include/net/route.h b/include/net/route.h
+index ff021cab657e..4252c2724ec9 100644
+--- a/include/net/route.h
++++ b/include/net/route.h
+@@ -190,6 +190,9 @@ int ip_route_input_noref(struct sk_buff *skb, __be32 dst, __be32 src,
+ int ip_route_input_rcu(struct sk_buff *skb, __be32 dst, __be32 src,
+ 		       u8 tos, struct net_device *devin,
+ 		       struct fib_result *res);
++int ip_route_input_common_rcu(struct sk_buff *skb, __be32 dst, __be32 src,
++			      u8 tos, struct net_device *devin, __be32 lsrc,
++			      struct fib_result *res);
+ 
+ int ip_route_use_hint(struct sk_buff *skb, __be32 dst, __be32 src,
+ 		      u8 tos, struct net_device *devin,
+@@ -229,6 +232,8 @@ unsigned int inet_addr_type_dev_table(struct net *net,
+ void ip_rt_multicast_event(struct in_device *);
+ int ip_rt_ioctl(struct net *, unsigned int cmd, struct rtentry *rt);
+ void ip_rt_get_source(u8 *src, struct sk_buff *skb, struct rtable *rt);
++int ip_route_input_lookup(struct sk_buff*, __be32 dst, __be32 src, u8 tos,
++			  struct net_device *devin, __be32 lsrc);
+ struct rtable *rt_dst_alloc(struct net_device *dev,
+ 			     unsigned int flags, u16 type,
+ 			     bool nopolicy, bool noxfrm);
+diff --git a/include/uapi/linux/ip.h b/include/uapi/linux/ip.h
+index e42d13b55cf3..d03711046f2e 100644
+--- a/include/uapi/linux/ip.h
++++ b/include/uapi/linux/ip.h
+@@ -169,6 +169,9 @@ enum
+ 	IPV4_DEVCONF_DROP_UNICAST_IN_L2_MULTICAST,
+ 	IPV4_DEVCONF_DROP_GRATUITOUS_ARP,
+ 	IPV4_DEVCONF_BC_FORWARDING,
++	IPV4_DEVCONF_HIDDEN,
++	IPV4_DEVCONF_RP_FILTER_MASK,
++	IPV4_DEVCONF_FORWARD_SHARED,
+ 	__IPV4_DEVCONF_MAX
+ };
+ 
+diff --git a/include/uapi/linux/rtnetlink.h b/include/uapi/linux/rtnetlink.h
+index 9b814c92de12..8b8dceaf0348 100644
+--- a/include/uapi/linux/rtnetlink.h
++++ b/include/uapi/linux/rtnetlink.h
+@@ -178,6 +178,13 @@ enum {
+ 	RTM_GETVLAN,
+ #define RTM_GETVLAN	RTM_GETVLAN
+ 
++	RTM_NEWARPRULE	= 116,
++#define	RTM_NEWARPRULE	RTM_NEWARPRULE
++	RTM_DELARPRULE,
++#define	RTM_DELARPRULE	RTM_DELARPRULE
++	RTM_GETARPRULE,
++#define	RTM_GETARPRULE	RTM_GETARPRULE
++
+ 	__RTM_MAX,
+ #define RTM_MAX		(((__RTM_MAX + 3) & ~3) - 1)
+ };
+@@ -399,8 +406,11 @@ struct rtnexthop {
+ #define RTNH_F_OFFLOAD		8	/* offloaded route */
+ #define RTNH_F_LINKDOWN		16	/* carrier-down on nexthop */
+ #define RTNH_F_UNRESOLVED	32	/* The entry is unresolved (ipmr) */
++#define RTNH_F_SUSPECT		64	/* We don't know the real state	*/
++#define RTNH_F_BADSTATE		(RTNH_F_DEAD | RTNH_F_SUSPECT)
+ 
+-#define RTNH_COMPARE_MASK	(RTNH_F_DEAD | RTNH_F_LINKDOWN | RTNH_F_OFFLOAD)
++#define RTNH_COMPARE_MASK	(RTNH_F_DEAD | RTNH_F_LINKDOWN | \
++				 RTNH_F_OFFLOAD | RTNH_F_SUSPECT)
+ 
+ /* Macros to handle hexthops */
+ 
+@@ -648,6 +658,54 @@ enum {
+ 
+ #define NDUSEROPT_MAX	(__NDUSEROPT_MAX - 1)
+ 
++/******************************************************************************
++ *		Definitions used in ARP tables administration
++ ****/
++
++#define ARPA_TABLE_INPUT	0
++#define ARPA_TABLE_OUTPUT	1
++#define ARPA_TABLE_FORWARD	2
++#define ARPA_TABLE_ALL		-1
++
++#define ARPM_F_PREFSRC		0x0001
++#define ARPM_F_WILDIIF		0x0002
++#define ARPM_F_WILDOIF		0x0004
++#define ARPM_F_BROADCAST	0x0008
++#define ARPM_F_UNICAST		0x0010
++
++struct arpmsg
++{
++	unsigned char		arpm_family;
++	unsigned char		arpm_table;
++	unsigned char		arpm_action;
++	unsigned char		arpm_from_len;
++	unsigned char		arpm_to_len;
++	unsigned char		arpm__pad1;
++	unsigned short		arpm__pad2;
++	unsigned		arpm_pref;
++	unsigned		arpm_flags;
++};
++
++enum
++{
++	ARPA_UNSPEC,
++	ARPA_FROM,			/* FROM IP prefix	*/
++	ARPA_TO,			/* TO IP prefix		*/
++	ARPA_LLFROM,			/* FROM LL prefix	*/
++	ARPA_LLTO,			/* TO LL prefix		*/
++	ARPA_LLSRC,			/* New SRC lladdr	*/
++	ARPA_LLDST,			/* New DST lladdr	*/
++	ARPA_IIF,			/* In interface prefix	*/
++	ARPA_OIF,			/* Out interface prefix	*/
++	ARPA_SRC,			/* New IP SRC		*/
++	ARPA_DST,			/* New IP DST, not used	*/
++	ARPA_PACKETS,			/* Packets		*/
++};
++
++#define ARPA_MAX	ARPA_PACKETS
++
++#define ARPA_RTA(r)  ((struct rtattr*)(((char*)(r)) + NLMSG_ALIGN(sizeof(struct arpmsg))))
++
+ #ifndef __KERNEL__
+ /* RTnetlink multicast groups - backwards compatibility for userspace */
+ #define RTMGRP_LINK		1
+@@ -668,6 +726,8 @@ enum {
+ #define RTMGRP_DECnet_IFADDR    0x1000
+ #define RTMGRP_DECnet_ROUTE     0x4000
+ 
++#define RTMGRP_ARP		0x00010000
++
+ #define RTMGRP_IPV6_PREFIX	0x20000
+ #endif
+ 
+@@ -739,6 +799,8 @@ enum rtnetlink_groups {
+ #define RTNLGRP_NEXTHOP		RTNLGRP_NEXTHOP
+ 	RTNLGRP_BRVLAN,
+ #define RTNLGRP_BRVLAN		RTNLGRP_BRVLAN
++	RTNLGRP_ARP,
++#define RTNLGRP_ARP		RTNLGRP_ARP
+ 	__RTNLGRP_MAX
+ };
+ #define RTNLGRP_MAX	(__RTNLGRP_MAX - 1)
+diff --git a/net/bridge/br_netfilter_hooks.c b/net/bridge/br_netfilter_hooks.c
+index 8edfb98ae1d5..d8665d59ad95 100644
+--- a/net/bridge/br_netfilter_hooks.c
++++ b/net/bridge/br_netfilter_hooks.c
+@@ -359,6 +359,9 @@ static int br_nf_pre_routing_finish(struct net *net, struct sock *sk, struct sk_
+ 
+ 	nf_bridge->frag_max_size = IPCB(skb)->frag_max_size;
+ 
++	/* Old skb->dst is not expected, it is lost in all cases */
++	skb_dst_drop(skb);
++
+ 	if (nf_bridge->pkt_otherhost) {
+ 		skb->pkt_type = PACKET_OTHERHOST;
+ 		nf_bridge->pkt_otherhost = false;
+diff --git a/net/core/filter.c b/net/core/filter.c
+index 2ca5eecebacf..d9774440e180 100644
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -5319,6 +5319,7 @@ static int bpf_ipv4_fib_lookup(struct net *net, struct bpf_fib_lookup *params,
+ 	fl4.fl4_sport = params->sport;
+ 	fl4.fl4_dport = params->dport;
+ 	fl4.flowi4_multipath_hash = 0;
++	fl4.fl4_gw = 0;
+ 
+ 	if (flags & BPF_FIB_LOOKUP_DIRECT) {
+ 		u32 tbid = l3mdev_fib_table_rcu(dev) ? : RT_TABLE_MAIN;
+diff --git a/net/ipv4/arp.c b/net/ipv4/arp.c
+index 922dd73e5740..b748c2e6bc58 100644
+--- a/net/ipv4/arp.c
++++ b/net/ipv4/arp.c
+@@ -67,6 +67,9 @@
+  *					sending (e.g. insert 8021q tag).
+  *		Harald Welte	:	convert to make use of jenkins hash
+  *		Jesper D. Brouer:       Proxy ARP PVLAN RFC 3069 support.
++ *		Julian Anastasov:	"hidden" flag: hide the
++ *					interface and don't reply for it
++ *		Julian Anastasov:	ARP filtering via netlink
+  */
+ 
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+@@ -91,6 +94,7 @@
+ #include <linux/proc_fs.h>
+ #include <linux/seq_file.h>
+ #include <linux/stat.h>
++#include <net/netlink.h>
+ #include <linux/init.h>
+ #include <linux/net.h>
+ #include <linux/rcupdate.h>
+@@ -183,6 +187,48 @@ struct neigh_table arp_tbl = {
+ };
+ EXPORT_SYMBOL(arp_tbl);
+ 
++struct arpf_node {
++	struct arpf_node *	at_next;
++	u32			at_pref;
++	u32			at_from;
++	u32			at_from_mask;
++	u32			at_to;
++	u32			at_to_mask;
++	u32			at_src;
++	atomic_t		at_packets;
++	atomic_t		at_refcnt;
++	unsigned		at_flags;
++	unsigned char		at_from_len;
++	unsigned char		at_to_len;
++	unsigned char		at_action;
++	char			at_dead;
++	unsigned char		at_llfrom_len;
++	unsigned char		at_llto_len;
++	unsigned char		at_llsrc_len;
++	unsigned char		at_lldst_len;
++	unsigned char		at_iif_len;
++	unsigned char		at_oif_len;
++	unsigned short		at__pad1;
++	unsigned char		at_llfrom[MAX_ADDR_LEN];
++	unsigned char		at_llto[MAX_ADDR_LEN];
++	unsigned char		at_llsrc[MAX_ADDR_LEN];
++	unsigned char		at_lldst[MAX_ADDR_LEN];
++	char			at_iif[IFNAMSIZ];
++	char			at_oif[IFNAMSIZ];
++};
++
++static struct arpf_node *arp_tabs[3];
++
++static struct kmem_cache *arpf_cachep;
++
++static DEFINE_RWLOCK(arpf_lock);
++
++static void
++arpf_send(int table, struct net *net, struct sk_buff *skb, u32 sip, u32 tip,
++	  unsigned char *from_hw, unsigned char *to_hw,
++	  struct net_device *idev, struct net_device *odev,
++	  struct dst_entry *dst);
++
+ int arp_mc_map(__be32 addr, u8 *haddr, struct net_device *dev, int dir)
+ {
+ 	switch (dev->type) {
+@@ -336,7 +382,9 @@ static void arp_solicit(struct neighbour *neigh, struct sk_buff *skb)
+ 	struct net_device *dev = neigh->dev;
+ 	__be32 target = *(__be32 *)neigh->primary_key;
+ 	int probes = atomic_read(&neigh->probes);
+-	struct in_device *in_dev;
++	struct in_device *in_dev, *in_dev2;
++	struct net_device *dev2;
++	int mode;
+ 	struct dst_entry *dst = NULL;
+ 
+ 	rcu_read_lock();
+@@ -345,9 +393,22 @@ static void arp_solicit(struct neighbour *neigh, struct sk_buff *skb)
+ 		rcu_read_unlock();
+ 		return;
+ 	}
+-	switch (IN_DEV_ARP_ANNOUNCE(in_dev)) {
++	mode = IN_DEV_ARP_ANNOUNCE(in_dev);
++	if (mode != 2 && skb &&
++	    (dev2 = __ip_dev_find(dev_net(dev), ip_hdr(skb)->saddr,
++				  false)) != NULL &&
++	    (saddr = ip_hdr(skb)->saddr,
++	     in_dev2 = __in_dev_get_rcu(dev2)) != NULL &&
++	    IN_DEV_HIDDEN(in_dev2)) {
++		saddr = 0;
++		goto get;
++	}
++
++	switch (mode) {
+ 	default:
+ 	case 0:		/* By default announce any local IP */
++		if (saddr)
++			break;
+ 		if (skb && inet_addr_type_dev_table(dev_net(dev), dev,
+ 					  ip_hdr(skb)->saddr) == RTN_LOCAL)
+ 			saddr = ip_hdr(skb)->saddr;
+@@ -355,9 +416,10 @@ static void arp_solicit(struct neighbour *neigh, struct sk_buff *skb)
+ 	case 1:		/* Restrict announcements of saddr in same subnet */
+ 		if (!skb)
+ 			break;
+-		saddr = ip_hdr(skb)->saddr;
+-		if (inet_addr_type_dev_table(dev_net(dev), dev,
+-					     saddr) == RTN_LOCAL) {
++		if (saddr ||
++		    (saddr = ip_hdr(skb)->saddr,
++		     inet_addr_type_dev_table(dev_net(dev), dev,
++					     saddr) == RTN_LOCAL)) {
+ 			/* saddr should be known to target */
+ 			if (inet_addr_onlink(in_dev, target, saddr))
+ 				break;
+@@ -367,6 +429,8 @@ static void arp_solicit(struct neighbour *neigh, struct sk_buff *skb)
+ 	case 2:		/* Avoid secondary IPs, get a primary/preferred one */
+ 		break;
+ 	}
++
++get:
+ 	rcu_read_unlock();
+ 
+ 	if (!saddr)
+@@ -388,8 +452,8 @@ static void arp_solicit(struct neighbour *neigh, struct sk_buff *skb)
+ 
+ 	if (skb && !(dev->priv_flags & IFF_XMIT_DST_RELEASE))
+ 		dst = skb_dst(skb);
+-	arp_send_dst(ARPOP_REQUEST, ETH_P_ARP, target, dev, saddr,
+-		     dst_hw, dev->dev_addr, NULL, dst);
++	arpf_send(ARPA_TABLE_OUTPUT, dev_net(dev), skb, saddr, target, NULL,
++		  dst_hw, NULL, dev, dst);
+ }
+ 
+ static int arp_ignore(struct in_device *in_dev, __be32 sip, __be32 tip)
+@@ -446,6 +510,21 @@ static int arp_filter(__be32 sip, __be32 tip, struct net_device *dev)
+ 	return flag;
+ }
+ 
++static int arp_hidden(u32 tip, struct net_device *dev)
++{
++	struct net_device *dev2;
++	struct in_device *in_dev2;
++	int ret = 0;
++
++	if (!IPV4_DEVCONF_ALL(dev_net(dev), HIDDEN))
++		return 0;
++
++	if ((dev2 = __ip_dev_find(dev_net(dev), tip, false)) && dev2 != dev &&
++	    (in_dev2 = __in_dev_get_rcu(dev2)) && IN_DEV_HIDDEN(in_dev2))
++		ret = 1;
++	return ret;
++}
++
+ /*
+  * Check if we can use proxy ARP for this path
+  */
+@@ -806,9 +885,10 @@ static int arp_process(struct net *net, struct sock *sk, struct sk_buff *skb)
+ 	if (sip == 0) {
+ 		if (arp->ar_op == htons(ARPOP_REQUEST) &&
+ 		    inet_addr_type_dev_table(net, dev, tip) == RTN_LOCAL &&
++		    !arp_hidden(tip, dev) &&
+ 		    !arp_ignore(in_dev, sip, tip))
+-			arp_send_dst(ARPOP_REPLY, ETH_P_ARP, sip, dev, tip,
+-				     sha, dev->dev_addr, sha, reply_dst);
++			arpf_send(ARPA_TABLE_INPUT, net, skb, sip, tip, sha,
++				  tha, dev, NULL, reply_dst);
+ 		goto out_consume_skb;
+ 	}
+ 
+@@ -824,13 +904,14 @@ static int arp_process(struct net *net, struct sock *sk, struct sk_buff *skb)
+ 			dont_send = arp_ignore(in_dev, sip, tip);
+ 			if (!dont_send && IN_DEV_ARPFILTER(in_dev))
+ 				dont_send = arp_filter(sip, tip, dev);
++			if (!dont_send && skb->pkt_type != PACKET_HOST)
++				dont_send = arp_hidden(tip,dev); 
+ 			if (!dont_send) {
+ 				n = neigh_event_ns(&arp_tbl, sha, &sip, dev);
+ 				if (n) {
+-					arp_send_dst(ARPOP_REPLY, ETH_P_ARP,
+-						     sip, dev, tip, sha,
+-						     dev->dev_addr, sha,
+-						     reply_dst);
++					arpf_send(ARPA_TABLE_INPUT, net, skb,
++						  sip, tip, sha, tha, dev,
++						  NULL, reply_dst);
+ 					neigh_release(n);
+ 				}
+ 			}
+@@ -848,10 +929,9 @@ static int arp_process(struct net *net, struct sock *sk, struct sk_buff *skb)
+ 				if (NEIGH_CB(skb)->flags & LOCALLY_ENQUEUED ||
+ 				    skb->pkt_type == PACKET_HOST ||
+ 				    NEIGH_VAR(in_dev->arp_parms, PROXY_DELAY) == 0) {
+-					arp_send_dst(ARPOP_REPLY, ETH_P_ARP,
+-						     sip, dev, tip, sha,
+-						     dev->dev_addr, sha,
+-						     reply_dst);
++					arpf_send(ARPA_TABLE_FORWARD, net,
++						  skb, sip, tip, sha, tha, dev,
++						  rt->dst.dev, reply_dst);
+ 				} else {
+ 					pneigh_enqueue(&arp_tbl,
+ 						       in_dev->arp_parms, skb);
+@@ -1281,6 +1361,577 @@ void arp_ifdown(struct net_device *dev)
+ }
+ 
+ 
++static void arpf_destroy(struct arpf_node *afp)
++{
++	if (!afp->at_dead) {
++		printk(KERN_ERR "Destroying alive arp table node %p from %08lx\n", afp,
++		       *(((unsigned long*)&afp)-1));
++		return;
++	}
++	kmem_cache_free(arpf_cachep, afp);
++}
++
++static inline void arpf_put(struct arpf_node *afp)
++{
++	if (atomic_dec_and_test(&afp->at_refcnt))
++		arpf_destroy(afp);
++}
++
++static inline struct arpf_node *
++arpf_lookup(int table, struct sk_buff *skb, u32 sip, u32 tip,
++	    unsigned char *from_hw, unsigned char *to_hw,
++	    struct net_device *idev, struct net_device *odev)
++{
++	int sz_iif = idev? strlen(idev->name) : 0;
++	int sz_oif = odev? strlen(odev->name) : 0;
++	int alen;
++	struct arpf_node *afp;
++
++	if (ARPA_TABLE_OUTPUT != table) {
++		alen = idev->addr_len;
++	} else {
++		if (!from_hw) from_hw = odev->dev_addr;
++		if (!to_hw) to_hw = odev->broadcast;
++		alen = odev->addr_len;
++	}
++
++	read_lock_bh(&arpf_lock);
++	for (afp = arp_tabs[table]; afp; afp = afp->at_next) {
++		if ((tip ^ afp->at_to) & afp->at_to_mask)
++			continue;
++		if ((sip ^ afp->at_from) & afp->at_from_mask)
++			continue;
++		if (afp->at_llfrom_len &&
++		    (afp->at_llfrom_len > alen ||
++		     memcmp(from_hw, afp->at_llfrom, afp->at_llfrom_len)))
++			continue;
++		if (afp->at_llto_len &&
++		    (afp->at_llto_len > alen ||
++		     memcmp(to_hw, afp->at_llto, afp->at_llto_len)))
++			continue;
++		if (afp->at_iif_len &&
++		    (afp->at_iif_len > sz_iif ||
++		     memcmp(afp->at_iif, idev->name, afp->at_iif_len) ||
++		     (sz_iif != afp->at_iif_len &&
++		      !(afp->at_flags & ARPM_F_WILDIIF))))
++			continue;
++		if (afp->at_oif_len &&
++		    (afp->at_oif_len > sz_oif ||
++		     memcmp(afp->at_oif, odev->name, afp->at_oif_len) ||
++		     (sz_oif != afp->at_oif_len &&
++		      !(afp->at_flags & ARPM_F_WILDOIF))))
++			continue;
++		if (afp->at_flags & ARPM_F_BROADCAST &&
++		    skb->pkt_type == PACKET_HOST)
++			continue;
++		if (afp->at_flags & ARPM_F_UNICAST &&
++		    skb->pkt_type != PACKET_HOST)
++			continue;
++		if (afp->at_llsrc_len && afp->at_llsrc_len != alen)
++			continue;
++		if (afp->at_lldst_len && afp->at_lldst_len != alen)
++			continue;
++		atomic_inc(&afp->at_refcnt);
++		atomic_inc(&afp->at_packets);
++		break;
++	}
++	read_unlock_bh(&arpf_lock);
++	return afp;
++}
++
++static void
++arpf_send(int table, struct net *net, struct sk_buff *skb, u32 sip, u32 tip,
++	  unsigned char *from_hw, unsigned char *to_hw,
++	  struct net_device *idev, struct net_device *odev,
++	  struct dst_entry *dst)
++{
++	struct arpf_node *afp = NULL;
++
++	if (!arp_tabs[table] ||
++	    !net_eq(net, &init_net) ||
++	    !(afp = arpf_lookup(table, skb, sip, tip,
++				from_hw, to_hw, idev, odev))) {
++		switch (table) {
++		case ARPA_TABLE_INPUT:
++		case ARPA_TABLE_FORWARD:
++			arp_send_dst(ARPOP_REPLY, ETH_P_ARP, sip, idev, tip,
++				     from_hw, idev->dev_addr, from_hw, dst);
++			break;
++		case ARPA_TABLE_OUTPUT:
++			arp_send_dst(ARPOP_REQUEST, ETH_P_ARP, tip, odev, sip,
++				     to_hw, odev->dev_addr, NULL, dst);
++			break;
++		}
++		return;
++	}
++
++	/* deny? */
++	if (!afp->at_action) goto out;
++
++	switch (table) {
++	case ARPA_TABLE_INPUT:
++	case ARPA_TABLE_FORWARD:
++		arp_send_dst(ARPOP_REPLY, ETH_P_ARP, sip, idev, tip,
++			     afp->at_lldst_len?afp->at_lldst:from_hw,
++			     afp->at_llsrc_len?afp->at_llsrc:idev->dev_addr,
++			     afp->at_lldst_len?afp->at_lldst:from_hw, dst);
++		break;
++	case ARPA_TABLE_OUTPUT:
++		if (afp->at_flags & ARPM_F_PREFSRC && afp->at_src == 0) {
++			struct rtable *rt;
++			struct flowi4 fl4 = { .daddr = tip,
++					      .flowi4_oif = odev->ifindex };
++
++			rt = ip_route_output_key(net, &fl4);
++			if (IS_ERR(rt))
++				break;
++			sip = fl4.saddr;
++			ip_rt_put(rt);
++			if (!sip)
++				break;
++		}
++		arp_send_dst(ARPOP_REQUEST, ETH_P_ARP, tip, odev,
++			     afp->at_src?:sip,
++			     afp->at_lldst_len?afp->at_lldst:to_hw,
++			     afp->at_llsrc_len?afp->at_llsrc:odev->dev_addr,
++			     NULL, dst);
++		break;
++	}
++
++out:
++	arpf_put(afp);
++}
++
++static int
++arpf_fill_node(struct sk_buff *skb, u32 portid, u32 seq, unsigned flags,
++	       int event, int table, struct arpf_node *afp)
++{
++	struct arpmsg	*am;
++	struct nlmsghdr	*nlh;
++	u32 packets = atomic_read(&afp->at_packets);
++
++	nlh = nlmsg_put(skb, portid, seq, event, sizeof(*am), 0);
++	if (nlh == NULL)
++		return -ENOBUFS;
++	nlh->nlmsg_flags = flags;
++	am = nlmsg_data(nlh);
++	am->arpm_family = AF_UNSPEC;
++	am->arpm_table = table;
++	am->arpm_action = afp->at_action;
++	am->arpm_from_len = afp->at_from_len;
++	am->arpm_to_len = afp->at_to_len;
++	am->arpm_pref = afp->at_pref;
++	am->arpm_flags = afp->at_flags;
++	if (afp->at_from_len &&
++		nla_put(skb, ARPA_FROM, 4, &afp->at_from))
++		goto nla_put_failure;
++	if (afp->at_to_len &&
++		nla_put(skb, ARPA_TO, 4, &afp->at_to))
++		goto nla_put_failure;
++	if ((afp->at_src || afp->at_flags & ARPM_F_PREFSRC) &&
++		nla_put(skb, ARPA_SRC, 4, &afp->at_src))
++		goto nla_put_failure;
++	if (afp->at_iif[0] &&
++		nla_put(skb, ARPA_IIF, sizeof(afp->at_iif), afp->at_iif))
++		goto nla_put_failure;
++	if (afp->at_oif[0] &&
++		nla_put(skb, ARPA_OIF, sizeof(afp->at_oif), afp->at_oif))
++		goto nla_put_failure;
++	if (afp->at_llfrom_len &&
++		nla_put(skb, ARPA_LLFROM, afp->at_llfrom_len, afp->at_llfrom))
++		goto nla_put_failure;
++	if (afp->at_llto_len &&
++		nla_put(skb, ARPA_LLTO, afp->at_llto_len, afp->at_llto))
++		goto nla_put_failure;
++	if (afp->at_llsrc_len &&
++		nla_put(skb, ARPA_LLSRC, afp->at_llsrc_len, afp->at_llsrc))
++		goto nla_put_failure;
++	if (afp->at_lldst_len &&
++		nla_put(skb, ARPA_LLDST, afp->at_lldst_len, afp->at_lldst))
++		goto nla_put_failure;
++	if (nla_put(skb, ARPA_PACKETS, 4, &packets))
++		goto nla_put_failure;
++	nlmsg_end(skb, nlh);
++	return 0;
++
++nla_put_failure:
++	nlmsg_cancel(skb, nlh);
++	return -EMSGSIZE;
++}
++
++static void
++arpmsg_notify(struct sk_buff *oskb, struct nlmsghdr *nlh, int table,
++	      struct arpf_node *afp, int event)
++{
++	struct sk_buff *skb;
++	u32 portid = oskb ? NETLINK_CB(oskb).portid : 0;
++	int payload = sizeof(struct arpmsg) + 256;
++	int err = -ENOBUFS;
++
++	skb = nlmsg_new(nlmsg_total_size(payload), GFP_KERNEL);
++	if (!skb)
++		goto errout;
++
++	err = arpf_fill_node(skb, portid, nlh->nlmsg_seq, 0, event, table, afp);
++	if (err < 0) {
++		kfree_skb(skb);
++		goto errout;
++	}
++
++	rtnl_notify(skb, &init_net, portid, RTNLGRP_ARP, nlh, GFP_KERNEL);
++	return;
++errout:
++	if (err < 0)
++		rtnl_set_sk_err(&init_net, RTNLGRP_ARP, err);
++}
++
++static inline int
++arpf_str_size(int a, struct nlattr **rta, int maxlen)
++{
++	int size = 0;
++
++	if (rta[a] && (size = nla_len(rta[a]))) {
++		if (size > maxlen)
++			size = maxlen;
++	}
++	return size;
++}
++
++static inline int
++arpf_get_str(int a, struct nlattr **rta, unsigned char *p,
++	     int maxlen, unsigned char *l)
++{
++	int size = arpf_str_size(a, rta, maxlen);
++
++	if (size) {
++		memcpy(p, nla_data(rta[a]), size);
++		*l = size;
++	}
++	return size;
++}
++
++#define ARPF_MATCH_U32(ind, field)	(			\
++	(!rta[ind] && r->at_ ## field == 0) ||			\
++	(rta[ind] &&						\
++	 *(u32*) nla_data(rta[ind]) == r->at_ ## field))
++
++#define ARPF_MATCH_STR(ind, field)	(			\
++	(!rta[ind] && r->at_ ## field ## _len == 0) ||	\
++	(rta[ind] && r->at_ ## field ## _len &&		\
++	 r->at_ ## field ## _len < nla_len(rta[ind]) &&	\
++	 strcmp(nla_data(rta[ind]), r->at_ ## field) == 0))
++
++#define ARPF_MATCH_DATA(ind, field)	(			\
++	(!rta[ind] && r->at_ ## field ## _len == 0) ||	\
++	(rta[ind] && r->at_ ## field ## _len &&		\
++	 r->at_ ## field ## _len == nla_len(rta[ind]) &&	\
++	 memcmp(nla_data(rta[ind]), &r->at_ ## field,		\
++		r->at_ ## field ## _len) == 0))
++
++/* RTM_NEWARPRULE/RTM_DELARPRULE/RTM_GETARPRULE */
++
++int arpf_rule_ctl(struct sk_buff *skb, struct nlmsghdr *n,
++		  struct netlink_ext_ack *extack)
++{
++	struct net *net = sock_net(skb->sk);
++	struct nlattr *rta[ARPA_MAX + 1];
++	struct arpmsg *am;
++	struct arpf_node *r, **rp, **prevp = 0, **delp = 0, *newp = 0;
++	unsigned pref = 1;
++	int size, ret;
++
++	if (!capable(CAP_NET_ADMIN))
++		return -EPERM;
++
++	if (!net_eq(net, &init_net))
++		return -EINVAL;
++
++	ret = nlmsg_parse(n, sizeof(struct arpmsg), rta, ARPA_MAX, NULL,
++			  extack);
++	if (ret < 0)
++		return ret;
++
++	am = nlmsg_data(n);
++	ret = -EINVAL;
++	if (am->arpm_table >= sizeof(arp_tabs)/sizeof(arp_tabs[0]))
++		goto out;
++	if (!((~am->arpm_flags) & (ARPM_F_BROADCAST|ARPM_F_UNICAST)))
++		goto out;
++	if (am->arpm_action > 1)
++		goto out;
++	if (am->arpm_to_len > 32 || am->arpm_from_len > 32)
++		goto out;
++	if (am->arpm_flags & ARPM_F_WILDIIF &&
++	    (!rta[ARPA_IIF] || !nla_len(rta[ARPA_IIF]) ||
++	    !*(char*) nla_data(rta[ARPA_IIF])))
++		am->arpm_flags &= ~ARPM_F_WILDIIF;
++	if (am->arpm_flags & ARPM_F_WILDOIF &&
++	    (!rta[ARPA_OIF] || !nla_len(rta[ARPA_OIF]) ||
++	    !*(char*) nla_data(rta[ARPA_OIF])))
++		am->arpm_flags &= ~ARPM_F_WILDOIF;
++	switch (am->arpm_table) {
++	case ARPA_TABLE_INPUT:
++		if (rta[ARPA_SRC] || rta[ARPA_OIF])
++			goto out;
++		break;
++	case ARPA_TABLE_OUTPUT:
++		if (rta[ARPA_IIF])
++			goto out;
++		if (am->arpm_flags & (ARPM_F_BROADCAST|ARPM_F_UNICAST))
++			goto out;
++		break;
++	case ARPA_TABLE_FORWARD:
++		if (rta[ARPA_SRC])
++			goto out;
++		break;
++	}
++	if (rta[ARPA_SRC] && !*(u32*) nla_data(rta[ARPA_SRC]))
++		am->arpm_flags |= ARPM_F_PREFSRC;
++	else
++		am->arpm_flags &= ~ARPM_F_PREFSRC;
++
++	for (rp = &arp_tabs[am->arpm_table]; (r=*rp) != NULL; rp=&r->at_next) {
++		if (pref < r->at_pref)
++			prevp = rp;
++		if (am->arpm_pref == r->at_pref ||
++		    (!am->arpm_pref &&
++		     am->arpm_to_len == r->at_to_len &&
++		     am->arpm_from_len == r->at_from_len &&
++		     !((am->arpm_flags ^ r->at_flags) &
++		       (ARPM_F_BROADCAST | ARPM_F_UNICAST |
++		        ARPM_F_WILDIIF | ARPM_F_WILDOIF)) &&
++		     ARPF_MATCH_U32(ARPA_TO, to) &&
++		     ARPF_MATCH_U32(ARPA_FROM, from) &&
++		     ARPF_MATCH_DATA(ARPA_LLFROM, llfrom) &&
++		     ARPF_MATCH_DATA(ARPA_LLTO, llto) &&
++		     ARPF_MATCH_STR(ARPA_IIF, iif) &&
++		     ARPF_MATCH_STR(ARPA_OIF, oif) &&
++		     (n->nlmsg_type != RTM_DELARPRULE ||
++		      /* DEL matches more keys */
++		      (am->arpm_flags == r->at_flags &&
++		       am->arpm_action == r->at_action &&
++		       ARPF_MATCH_U32(ARPA_SRC, src) &&
++		       ARPF_MATCH_DATA(ARPA_LLSRC, llsrc) &&
++		       ARPF_MATCH_DATA(ARPA_LLDST, lldst)
++		      )
++		     )
++		    )
++		   )
++			break;
++		if (am->arpm_pref && r->at_pref > am->arpm_pref) {
++			r = NULL;
++			break;
++		}
++		pref = r->at_pref+1;
++	}
++
++	/*
++	 * r=NULL:	*rp != NULL (stopped before next pref), pref: not valid
++	 *		*rp == NULL (not found), pref: ready to use
++	 * r!=NULL:	found, pref: not valid
++	 *
++	 * prevp=NULL:	no free slot
++	 * prevp!=NULL:	free slot for rule
++	 */
++
++	if (n->nlmsg_type == RTM_DELARPRULE) {
++		if (!r)
++			return -ESRCH;
++		delp = rp;
++		goto dequeue;
++	}
++
++	if (r) {
++		/* Existing rule */
++		ret = -EEXIST;
++		if (n->nlmsg_flags&NLM_F_EXCL)
++			goto out;
++
++		if (n->nlmsg_flags&NLM_F_REPLACE) {
++			pref = r->at_pref;
++			prevp = delp = rp;
++			goto replace;
++		}
++	}
++
++	if (n->nlmsg_flags&NLM_F_APPEND) {
++		if (r) {
++			pref = r->at_pref+1;
++			for (rp=&r->at_next; (r=*rp) != NULL; rp=&r->at_next) {
++				if (pref != r->at_pref)
++					break;
++				pref ++;
++			}
++			ret = -EBUSY;
++			if (!pref)
++				goto out;
++		} else if (am->arpm_pref)
++			pref = am->arpm_pref;
++		prevp = rp;
++	}
++
++	if (!(n->nlmsg_flags&NLM_F_CREATE)) {
++		ret = -ENOENT;
++		if (n->nlmsg_flags&NLM_F_EXCL || r)
++			ret = 0;
++		goto out;
++	}
++
++	if (!(n->nlmsg_flags&NLM_F_APPEND)) {
++		if (!prevp) {
++			ret = -EBUSY;
++			if (r || *rp ||
++			    (!am->arpm_pref && arp_tabs[am->arpm_table]))
++				goto out;
++			prevp = rp;
++			pref = am->arpm_pref? : 99;
++		} else {
++			if (r || !am->arpm_pref) {
++				pref = (*prevp)->at_pref - 1;
++				if (am->arpm_pref && am->arpm_pref < pref)
++					pref = am->arpm_pref;
++			} else {
++				prevp = rp;
++				pref = am->arpm_pref;
++			}
++		}
++	}
++
++replace:
++
++	ret = -ENOMEM;
++	r = kmem_cache_alloc(arpf_cachep, GFP_KERNEL);
++	if (!r)
++		return ret;
++	memset(r, 0, sizeof(*r));
++
++	arpf_get_str(ARPA_LLFROM, rta, r->at_llfrom, MAX_ADDR_LEN,
++		     &r->at_llfrom_len);
++	arpf_get_str(ARPA_LLTO, rta, r->at_llto, MAX_ADDR_LEN,
++		     &r->at_llto_len);
++	arpf_get_str(ARPA_LLSRC, rta, r->at_llsrc, MAX_ADDR_LEN,
++		     &r->at_llsrc_len);
++	arpf_get_str(ARPA_LLDST, rta, r->at_lldst, MAX_ADDR_LEN,
++		     &r->at_lldst_len);
++
++	if (delp)
++		r->at_next = (*delp)->at_next;
++	else if (*prevp)
++		r->at_next = *prevp;
++
++	r->at_pref = pref;
++	r->at_from_len = am->arpm_from_len;
++	r->at_from_mask = inet_make_mask(r->at_from_len);
++	if (rta[ARPA_FROM])
++		r->at_from = *(u32*) nla_data(rta[ARPA_FROM]);
++	r->at_from &= r->at_from_mask;
++	r->at_to_len = am->arpm_to_len;
++	r->at_to_mask = inet_make_mask(r->at_to_len);
++	if (rta[ARPA_TO])
++		r->at_to = *(u32*) nla_data(rta[ARPA_TO]);
++	r->at_to &= r->at_to_mask;
++	if (rta[ARPA_SRC])
++		r->at_src = *(u32*) nla_data(rta[ARPA_SRC]);
++	if (rta[ARPA_PACKETS]) {
++		u32 packets = *(u32*) nla_data(rta[ARPA_PACKETS]);
++		atomic_set(&r->at_packets, packets);
++	}
++	atomic_set(&r->at_refcnt, 1);
++	r->at_flags = am->arpm_flags;
++	r->at_action = am->arpm_action;
++
++	if (rta[ARPA_IIF] && (size = nla_len(rta[ARPA_IIF]))) {
++		if (size >= sizeof(r->at_iif))
++			size = sizeof(r->at_iif)-1;
++		memcpy(r->at_iif, nla_data(rta[ARPA_IIF]), size);
++		r->at_iif_len = strlen(r->at_iif);
++	}
++	if (rta[ARPA_OIF] && (size = nla_len(rta[ARPA_OIF]))) {
++		if (size >= sizeof(r->at_oif))
++			size = sizeof(r->at_oif)-1;
++		memcpy(r->at_oif, nla_data(rta[ARPA_OIF]), size);
++		r->at_oif_len = strlen(r->at_oif);
++	}
++
++	newp = r;
++
++dequeue:
++
++	if (delp) {
++		r = *delp;
++		write_lock_bh(&arpf_lock);
++		if (newp) {
++			if (!rta[ARPA_PACKETS])
++				atomic_set(&newp->at_packets,
++					atomic_read(&r->at_packets));
++			*delp = newp;
++		} else {
++			*delp = r->at_next;
++		}
++		r->at_dead = 1;
++		write_unlock_bh(&arpf_lock);
++		arpmsg_notify(skb, n, am->arpm_table, r, RTM_DELARPRULE);
++		arpf_put(r);
++		prevp = 0;
++	}
++
++	if (newp) {
++		if (prevp) {
++			write_lock_bh(&arpf_lock);
++			*prevp = newp;
++			write_unlock_bh(&arpf_lock);
++		}
++		arpmsg_notify(skb, n, am->arpm_table, newp, RTM_NEWARPRULE);
++	}
++
++	ret = 0;
++
++out:
++	return ret;
++}
++
++int arpf_dump_table(int t, struct sk_buff *skb, struct netlink_callback *cb)
++{
++	int idx, ret = -1;
++	struct arpf_node *afp;
++	int s_idx = cb->args[1];
++
++	for (idx=0, afp = arp_tabs[t]; afp; afp = afp->at_next, idx++) {
++		if (idx < s_idx)
++			continue;
++		if (arpf_fill_node(skb, NETLINK_CB(cb->skb).portid,
++		    cb->nlh->nlmsg_seq, NLM_F_MULTI, RTM_NEWARPRULE, t, afp) < 0)
++			goto out;
++	}
++
++	ret = skb->len;
++
++out:
++	cb->args[1] = idx;
++
++	return ret;
++}
++
++int arpf_dump_rules(struct sk_buff *skb, struct netlink_callback *cb)
++{
++	int idx;
++	int s_idx = cb->args[0];
++
++	read_lock_bh(&arpf_lock);
++	for (idx = 0; idx < sizeof(arp_tabs)/sizeof(arp_tabs[0]); idx++) {
++		if (idx < s_idx)
++			continue;
++		if (idx > s_idx)
++			memset(&cb->args[1], 0, sizeof(cb->args)-1*sizeof(cb->args[0]));
++		if (arpf_dump_table(idx, skb, cb) < 0)
++			break;
++	}
++	read_unlock_bh(&arpf_lock);
++	cb->args[0] = idx;
++
++	return skb->len;
++}
++
+ /*
+  *	Called once on startup.
+  */
+@@ -1294,6 +1945,16 @@ static int arp_proc_init(void);
+ 
+ void __init arp_init(void)
+ {
++	arpf_cachep = kmem_cache_create("ip_arpf_cache",
++					sizeof(struct arpf_node), 0,
++					SLAB_HWCACHE_ALIGN, NULL);
++	if (!arpf_cachep)
++		panic("IP: failed to allocate ip_arpf_cache\n");
++
++	rtnl_register(PF_UNSPEC, RTM_NEWARPRULE, arpf_rule_ctl, NULL, 0);
++	rtnl_register(PF_UNSPEC, RTM_DELARPRULE, arpf_rule_ctl, NULL, 0);
++	rtnl_register(PF_UNSPEC, RTM_GETARPRULE, NULL, arpf_dump_rules, 0);
++
+ 	neigh_table_init(NEIGH_ARP_TABLE, &arp_tbl);
+ 
+ 	dev_add_pack(&arp_packet_type);
+diff --git a/net/ipv4/devinet.c b/net/ipv4/devinet.c
+index 123a6d39438f..259eaa485d8f 100644
+--- a/net/ipv4/devinet.c
++++ b/net/ipv4/devinet.c
+@@ -1358,9 +1358,16 @@ __be32 inet_select_addr(const struct net_device *dev, __be32 dst, int scope)
+ 		if (!in_dev)
+ 			continue;
+ 
+-		addr = in_dev_select_addr(in_dev, scope);
+-		if (addr)
+-			goto out_unlock;
++		in_dev_for_each_ifa_rcu(ifa, in_dev) {
++			if (ifa->ifa_flags & IFA_F_SECONDARY)
++				break;
++			if (!IN_DEV_HIDDEN(in_dev) &&
++			    ifa->ifa_scope != RT_SCOPE_LINK &&
++			    ifa->ifa_scope <= scope) {
++				addr = ifa->ifa_local;
++				goto out_unlock;
++			}
++		}
+ 	}
+ out_unlock:
+ 	rcu_read_unlock();
+@@ -2515,13 +2522,16 @@ static struct devinet_sysctl_table {
+ 		DEVINET_SYSCTL_RW_ENTRY(SEND_REDIRECTS, "send_redirects"),
+ 		DEVINET_SYSCTL_RW_ENTRY(ACCEPT_SOURCE_ROUTE,
+ 					"accept_source_route"),
++		DEVINET_SYSCTL_RW_ENTRY(FORWARD_SHARED, "forward_shared"),
+ 		DEVINET_SYSCTL_RW_ENTRY(ACCEPT_LOCAL, "accept_local"),
+ 		DEVINET_SYSCTL_RW_ENTRY(SRC_VMARK, "src_valid_mark"),
+ 		DEVINET_SYSCTL_RW_ENTRY(PROXY_ARP, "proxy_arp"),
+ 		DEVINET_SYSCTL_RW_ENTRY(MEDIUM_ID, "medium_id"),
++		DEVINET_SYSCTL_RW_ENTRY(RP_FILTER_MASK, "rp_filter_mask"),
+ 		DEVINET_SYSCTL_RW_ENTRY(BOOTP_RELAY, "bootp_relay"),
+ 		DEVINET_SYSCTL_RW_ENTRY(LOG_MARTIANS, "log_martians"),
+ 		DEVINET_SYSCTL_RW_ENTRY(TAG, "tag"),
++		DEVINET_SYSCTL_RW_ENTRY(HIDDEN, "hidden"),
+ 		DEVINET_SYSCTL_RW_ENTRY(ARPFILTER, "arp_filter"),
+ 		DEVINET_SYSCTL_RW_ENTRY(ARP_ANNOUNCE, "arp_announce"),
+ 		DEVINET_SYSCTL_RW_ENTRY(ARP_IGNORE, "arp_ignore"),
+diff --git a/net/ipv4/fib_frontend.c b/net/ipv4/fib_frontend.c
+index 84bb707bd88d..4b4b546b8cd4 100644
+--- a/net/ipv4/fib_frontend.c
++++ b/net/ipv4/fib_frontend.c
+@@ -48,6 +48,8 @@
+ 
+ #ifndef CONFIG_IP_MULTIPLE_TABLES
+ 
++#define FIB_RES_TABLE(r) (RT_TABLE_MAIN)
++
+ static int __net_init fib4_rules_init(struct net *net)
+ {
+ 	struct fib_table *local_table, *main_table;
+@@ -72,6 +74,8 @@ static int __net_init fib4_rules_init(struct net *net)
+ }
+ #else
+ 
++#define FIB_RES_TABLE(r) (fib_result_table(r))
++
+ struct fib_table *fib_new_table(struct net *net, u32 id)
+ {
+ 	struct fib_table *tb, *alias = NULL;
+@@ -342,13 +346,19 @@ EXPORT_SYMBOL_GPL(fib_info_nh_uses_dev);
+  */
+ static int __fib_validate_source(struct sk_buff *skb, __be32 src, __be32 dst,
+ 				 u8 tos, int oif, struct net_device *dev,
+-				 int rpf, struct in_device *idev, u32 *itag)
++				 int rpf, struct in_device *idev, u32 *itag,
++				 int our)
+ {
+ 	struct net *net = dev_net(dev);
+ 	struct flow_keys flkeys;
++	u32 table;
++	unsigned char prefixlen;
++	unsigned char scope;
+ 	int ret, no_addr;
+ 	struct fib_result res;
+ 	struct flowi4 fl4;
++	int fwdsh;
++	unsigned int rpf_mask;
+ 	bool dev_match;
+ 
+ 	fl4.flowi4_oif = 0;
+@@ -363,10 +373,13 @@ static int __fib_validate_source(struct sk_buff *skb, __be32 src, __be32 dst,
+ 	fl4.flowi4_flags = 0;
+ 	fl4.flowi4_uid = sock_net_uid(net, NULL);
+ 	fl4.flowi4_multipath_hash = 0;
++	fl4.fl4_gw = 0;
+ 
+ 	no_addr = idev->ifa_list == NULL;
+ 
++	fwdsh = IN_DEV_FORWARD_SHARED(idev);
+ 	fl4.flowi4_mark = IN_DEV_SRC_VMARK(idev) ? skb->mark : 0;
++	rpf_mask = IN_DEV_RPFILTER_MASK(idev);
+ 	if (!fib4_rules_early_flow_dissect(net, skb, &fl4, &flkeys)) {
+ 		fl4.flowi4_proto = 0;
+ 		fl4.fl4_sport = 0;
+@@ -375,7 +388,12 @@ static int __fib_validate_source(struct sk_buff *skb, __be32 src, __be32 dst,
+ 
+ 	if (fib_lookup(net, &fl4, &res, 0))
+ 		goto last_resort;
+-	if (res.type != RTN_UNICAST &&
++	if (fwdsh) {
++		fwdsh = (res.type == RTN_LOCAL && !our);
++		if (fwdsh)
++			rpf = 0;
++	}
++	if (res.type != RTN_UNICAST && !fwdsh &&
+ 	    (res.type != RTN_LOCAL || !IN_DEV_ACCEPT_LOCAL(idev)))
+ 		goto e_inval;
+ 	fib_combine_itag(itag, &res);
+@@ -390,17 +408,36 @@ static int __fib_validate_source(struct sk_buff *skb, __be32 src, __be32 dst,
+ 		ret = FIB_RES_NHC(res)->nhc_scope >= RT_SCOPE_HOST;
+ 		return ret;
+ 	}
++	if (rpf_mask && rpf) {
++		int omi = 0;
++
++		idev = __in_dev_get_rcu(FIB_RES_DEV(res));
++		if (idev)
++			omi = IN_DEV_MEDIUM_ID(idev);
++		if (omi >= 1 && omi <= 31 && ((1 << omi) & rpf_mask))
++			rpf = 0;
++	}
+ 	if (no_addr)
+ 		goto last_resort;
+-	if (rpf == 1)
+-		goto e_rpf;
++	table = FIB_RES_TABLE(&res);
++	prefixlen = res.prefixlen;
++	scope = res.scope;
+ 	fl4.flowi4_oif = dev->ifindex;
++	if (fwdsh)
++		fl4.flowi4_iif = LOOPBACK_IFINDEX;
+ 
+ 	ret = 0;
+ 	if (fib_lookup(net, &fl4, &res, FIB_LOOKUP_IGNORE_LINKSTATE) == 0) {
+-		if (res.type == RTN_UNICAST)
++		if (res.type == RTN_UNICAST &&
++		    ((table == FIB_RES_TABLE(&res) &&
++		      res.prefixlen >= prefixlen && res.scope >= scope) ||
++		     !rpf)) {
+ 			ret = FIB_RES_NHC(res)->nhc_scope >= RT_SCOPE_HOST;
++			return ret;
++		}
+ 	}
++	if (rpf == 1)
++		goto e_rpf;
+ 	return ret;
+ 
+ last_resort:
+@@ -418,7 +455,7 @@ static int __fib_validate_source(struct sk_buff *skb, __be32 src, __be32 dst,
+ /* Ignore rp_filter for packets protected by IPsec. */
+ int fib_validate_source(struct sk_buff *skb, __be32 src, __be32 dst,
+ 			u8 tos, int oif, struct net_device *dev,
+-			struct in_device *idev, u32 *itag)
++			struct in_device *idev, u32 *itag, int our)
+ {
+ 	int r = secpath_exists(skb) ? 0 : IN_DEV_RPFILTER(idev);
+ 	struct net *net = dev_net(dev);
+@@ -443,7 +480,8 @@ int fib_validate_source(struct sk_buff *skb, __be32 src, __be32 dst,
+ 	}
+ 
+ full_check:
+-	return __fib_validate_source(skb, src, dst, tos, oif, dev, r, idev, itag);
++	return __fib_validate_source(skb, src, dst, tos, oif, dev, r, idev,
++				     itag, our);
+ }
+ 
+ static inline __be32 sk_extract_addr(struct sockaddr *addr)
+@@ -1418,9 +1456,7 @@ static int fib_inetaddr_event(struct notifier_block *this, unsigned long event,
+ 	switch (event) {
+ 	case NETDEV_UP:
+ 		fib_add_ifaddr(ifa);
+-#ifdef CONFIG_IP_ROUTE_MULTIPATH
+ 		fib_sync_up(dev, RTNH_F_DEAD);
+-#endif
+ 		atomic_inc(&net->ipv4.dev_addr_genid);
+ 		rt_cache_flush(dev_net(dev));
+ 		break;
+@@ -1465,9 +1501,7 @@ static int fib_netdev_event(struct notifier_block *this, unsigned long event, vo
+ 		in_dev_for_each_ifa_rtnl(ifa, in_dev) {
+ 			fib_add_ifaddr(ifa);
+ 		}
+-#ifdef CONFIG_IP_ROUTE_MULTIPATH
+ 		fib_sync_up(dev, RTNH_F_DEAD);
+-#endif
+ 		atomic_inc(&net->ipv4.dev_addr_genid);
+ 		rt_cache_flush(net);
+ 		break;
+diff --git a/net/ipv4/fib_rules.c b/net/ipv4/fib_rules.c
+index ce54a30c2ef1..a3fa9cf6a2b8 100644
+--- a/net/ipv4/fib_rules.c
++++ b/net/ipv4/fib_rules.c
+@@ -77,6 +77,11 @@ unsigned int fib4_rules_seq_read(struct net *net)
+ 	return fib_rules_seq_read(net, AF_INET);
+ }
+ 
++u32 fib_result_table(struct fib_result *res)
++{
++	return res->table ? res->table->tb_id : RT_TABLE_UNSPEC;
++}
++
+ int __fib_lookup(struct net *net, struct flowi4 *flp,
+ 		 struct fib_result *res, unsigned int flags)
+ {
+diff --git a/net/ipv4/fib_semantics.c b/net/ipv4/fib_semantics.c
+index 1f75dc686b6b..c26ce7a7ff36 100644
+--- a/net/ipv4/fib_semantics.c
++++ b/net/ipv4/fib_semantics.c
+@@ -52,6 +52,7 @@ static struct hlist_head *fib_info_hash;
+ static struct hlist_head *fib_info_laddrhash;
+ static unsigned int fib_info_hash_size;
+ static unsigned int fib_info_cnt;
++DEFINE_RWLOCK(fib_nhflags_lock);
+ 
+ #define DEVINDEX_HASHBITS 8
+ #define DEVINDEX_HASHSIZE (1U << DEVINDEX_HASHBITS)
+@@ -538,36 +539,77 @@ void rtmsg_fib(int event, __be32 key, struct fib_alias *fa,
+ 
+ static int fib_detect_death(struct fib_info *fi, int order,
+ 			    struct fib_info **last_resort, int *last_idx,
+-			    int dflt)
++			    int dflt, int *last_nhsel,
++			    const struct flowi4 *flp)
+ {
+-	const struct fib_nh_common *nhc = fib_info_nhc(fi, 0);
++	struct fib_nh_common *nhc;
+ 	struct neighbour *n;
+-	int state = NUD_NONE;
++	int nhsel;
++	int state;
++	int flag, dead = 1;
++
++	/* change_nexthops(fi) { */
++	for (nhsel = 0; nhsel < fib_info_num_path(fi); nhsel++) {
++		nhc = fib_info_nhc(fi, nhsel);
++		if (flp->flowi4_oif && flp->flowi4_oif != nhc->nhc_oif &&
++		    !(flp->flowi4_flags & FLOWI_FLAG_SKIP_NH_OIF))
++			continue;
++		if (flp->fl4_gw && flp->fl4_gw != nhc->nhc_gw.ipv4 &&
++		    nhc->nhc_gw.ipv4 && nhc->nhc_scope == RT_SCOPE_LINK)
++			continue;
++		if (nhc->nhc_flags & RTNH_F_DEAD)
++			continue;
+ 
+-	if (likely(nhc->nhc_gw_family == AF_INET))
+-		n = neigh_lookup(&arp_tbl, &nhc->nhc_gw.ipv4, nhc->nhc_dev);
+-	else if (nhc->nhc_gw_family == AF_INET6)
+-		n = neigh_lookup(ipv6_stub->nd_tbl, &nhc->nhc_gw.ipv6,
+-				 nhc->nhc_dev);
+-	else
+-		n = NULL;
++		flag = 0;
++		if (nhc->nhc_dev->flags & IFF_NOARP) {
++			dead = 0;
++			goto setfl;
++		}
+ 
+-	if (n) {
+-		state = n->nud_state;
+-		neigh_release(n);
+-	} else {
+-		return 0;
+-	}
+-	if (state == NUD_REACHABLE)
+-		return 0;
+-	if ((state & NUD_VALID) && order != dflt)
+-		return 0;
+-	if ((state & NUD_VALID) ||
+-	    (*last_idx < 0 && order > dflt && state != NUD_INCOMPLETE)) {
+-		*last_resort = fi;
+-		*last_idx = order;
++		state = NUD_NONE;
++		if (!nhc->nhc_gw_family || nhc->nhc_scope != RT_SCOPE_LINK ||
++		    (nhc->nhc_gw_family == AF_INET && !nhc->nhc_gw.ipv4))
++			n = neigh_lookup(&arp_tbl, &flp->daddr,
++					 nhc->nhc_dev);
++		else if (likely(nhc->nhc_gw_family == AF_INET))
++			n = neigh_lookup(&arp_tbl, &nhc->nhc_gw.ipv4,
++					 nhc->nhc_dev);
++		else if (nhc->nhc_gw_family == AF_INET6)
++			n = neigh_lookup(ipv6_stub->nd_tbl, &nhc->nhc_gw.ipv6,
++					 nhc->nhc_dev);
++		else
++			n = NULL;
++		if (n) {
++			state = n->nud_state;
++			neigh_release(n);
++		}
++		if (state == NUD_REACHABLE ||
++		    ((state & NUD_VALID) && order != dflt)) {
++			dead = 0;
++			goto setfl;
++		}
++		if (!(state & NUD_VALID))
++			flag = 1;
++		if (!dead)
++			goto setfl;
++		if ((state & NUD_VALID) ||
++		    (*last_idx < 0 && order >= dflt)) {
++			*last_resort = fi;
++			*last_idx = order;
++			*last_nhsel = nhsel;
++		}
++
++setfl:
++		read_lock_bh(&fib_nhflags_lock);
++		if (flag)
++			nhc->nhc_flags |= RTNH_F_SUSPECT;
++		else
++			nhc->nhc_flags &= ~RTNH_F_SUSPECT;
++		read_unlock_bh(&fib_nhflags_lock);
+ 	}
+-	return 1;
++	/* } endfor_nexthops(fi) */
++
++	return dead;
+ }
+ 
+ int fib_nh_common_init(struct net *net, struct fib_nh_common *nhc,
+@@ -1063,6 +1105,7 @@ static int fib_check_nh_v6_gw(struct net *net, struct fib_nh *nh,
+ static int fib_check_nh_v4_gw(struct net *net, struct fib_nh *nh, u32 table,
+ 			      u8 scope, struct netlink_ext_ack *extack)
+ {
++	struct fib_info *fi = nh->nh_parent;
+ 	struct net_device *dev;
+ 	struct fib_result res;
+ 	int err = 0;
+@@ -1080,8 +1123,12 @@ static int fib_check_nh_v4_gw(struct net *net, struct fib_nh *nh, u32 table,
+ 			return -ENODEV;
+ 		}
+ 		if (!(dev->flags & IFF_UP)) {
+-			NL_SET_ERR_MSG(extack, "Nexthop device is not up");
+-			return -ENETDOWN;
++			if (fi->fib_protocol != RTPROT_STATIC) {
++				NL_SET_ERR_MSG(extack,
++					       "Nexthop device is not up");
++				return -ENETDOWN;
++			}
++			nh->fib_nh_flags |= RTNH_F_DEAD;
+ 		}
+ 		addr_type = inet_addr_type_dev_table(net, dev, nh->fib_nh_gw4);
+ 		if (addr_type != RTN_UNICAST) {
+@@ -1125,11 +1172,29 @@ static int fib_check_nh_v4_gw(struct net *net, struct fib_nh *nh, u32 table,
+ 			err = fib_lookup(net, &fl4, &res,
+ 					 FIB_LOOKUP_IGNORE_LINKSTATE);
+ 		}
++	}
++
++	if (err) {
++		struct in_device *in_dev;
+ 
+-		if (err) {
++		if (err != -ENETUNREACH ||
++		    fi->fib_protocol != RTPROT_STATIC) {
+ 			NL_SET_ERR_MSG(extack, "Nexthop has invalid gateway");
+ 			goto out;
+ 		}
++		in_dev = inetdev_by_index(net, nh->fib_nh_oif);
++		if (in_dev == NULL ||
++		    in_dev->dev->flags & IFF_UP) {
++			NL_SET_ERR_MSG(extack,
++				       "Nexthop has invalid gateway");
++			goto out;
++		}
++		nh->fib_nh_flags |= RTNH_F_DEAD;
++		nh->fib_nh_scope = RT_SCOPE_LINK;
++		nh->fib_nh_dev = in_dev->dev;
++		dev_hold(nh->fib_nh_dev);
++		err = 0;
++		goto out;
+ 	}
+ 
+ 	err = -EINVAL;
+@@ -1148,7 +1213,16 @@ static int fib_check_nh_v4_gw(struct net *net, struct fib_nh *nh, u32 table,
+ 	dev_hold(dev);
+ 	if (!netif_carrier_ok(dev))
+ 		nh->fib_nh_flags |= RTNH_F_LINKDOWN;
+-	err = (dev->flags & IFF_UP) ? 0 : -ENETDOWN;
++	if (!(dev->flags & IFF_UP)) {
++		if (fi->fib_protocol != RTPROT_STATIC) {
++			err = -ENETDOWN;
++			NL_SET_ERR_MSG(extack,
++				       "Device for nexthop is not up");
++			goto out;
++		}
++		nh->fib_nh_flags |= RTNH_F_DEAD;
++	}
++	err = 0;
+ out:
+ 	rcu_read_unlock();
+ 	return err;
+@@ -1157,6 +1231,7 @@ static int fib_check_nh_v4_gw(struct net *net, struct fib_nh *nh, u32 table,
+ static int fib_check_nh_nongw(struct net *net, struct fib_nh *nh,
+ 			      struct netlink_ext_ack *extack)
+ {
++	struct fib_info *fi = nh->nh_parent;
+ 	struct in_device *in_dev;
+ 	int err;
+ 
+@@ -1174,8 +1249,11 @@ static int fib_check_nh_nongw(struct net *net, struct fib_nh *nh,
+ 		goto out;
+ 	err = -ENETDOWN;
+ 	if (!(in_dev->dev->flags & IFF_UP)) {
+-		NL_SET_ERR_MSG(extack, "Device for nexthop is not up");
+-		goto out;
++		if (fi->fib_protocol != RTPROT_STATIC) {
++			NL_SET_ERR_MSG(extack, "Device for nexthop is not up");
++			goto out;
++		}
++		nh->fib_nh_flags |= RTNH_F_DEAD;
+ 	}
+ 
+ 	nh->fib_nh_dev = in_dev->dev;
+@@ -1959,10 +2037,15 @@ int fib_sync_down_dev(struct net_device *dev, unsigned long event, bool force)
+ 		prev_fi = fi;
+ 		dead = 0;
+ 		change_nexthops(fi) {
+-			if (nexthop_nh->fib_nh_flags & RTNH_F_DEAD)
+-				dead++;
+-			else if (nexthop_nh->fib_nh_dev == dev &&
+-				 nexthop_nh->fib_nh_scope != scope) {
++			if (nexthop_nh->fib_nh_flags & RTNH_F_DEAD) {
++				if (fi->fib_protocol != RTPROT_STATIC ||
++				    !nexthop_nh->fib_nh_dev ||
++				    !__in_dev_get_rtnl(nexthop_nh->fib_nh_dev) ||
++				    nexthop_nh->fib_nh_dev->flags&IFF_UP)
++					dead++;
++			} else if (nexthop_nh->fib_nh_dev == dev &&
++				   nexthop_nh->fib_nh_scope != scope) {
++				write_lock_bh(&fib_nhflags_lock);
+ 				switch (event) {
+ 				case NETDEV_DOWN:
+ 				case NETDEV_UNREGISTER:
+@@ -1974,7 +2057,11 @@ int fib_sync_down_dev(struct net_device *dev, unsigned long event, bool force)
+ 				}
+ 				call_fib_nh_notifiers(nexthop_nh,
+ 						      FIB_EVENT_NH_DEL);
+-				dead++;
++				write_unlock_bh(&fib_nhflags_lock);
++				if (fi->fib_protocol != RTPROT_STATIC ||
++				    force ||
++				    !__in_dev_get_rtnl(dev))
++					dead++;
+ 			}
+ #ifdef CONFIG_IP_ROUTE_MULTIPATH
+ 			if (event == NETDEV_UNREGISTER &&
+@@ -2004,20 +2091,19 @@ int fib_sync_down_dev(struct net_device *dev, unsigned long event, bool force)
+ }
+ 
+ /* Must be invoked inside of an RCU protected region.  */
+-static void fib_select_default(const struct flowi4 *flp, struct fib_result *res)
++void fib_select_default(const struct flowi4 *flp, struct fib_result *res)
+ {
+ 	struct fib_info *fi = NULL, *last_resort = NULL;
+ 	struct hlist_head *fa_head = res->fa_head;
+ 	struct fib_table *tb = res->table;
+ 	u8 slen = 32 - res->prefixlen;
+-	int order = -1, last_idx = -1;
++	int order = -1, last_idx = -1, last_nhsel = 0;
+ 	struct fib_alias *fa, *fa1 = NULL;
+ 	u32 last_prio = res->fi->fib_priority;
+ 	u8 last_tos = 0;
+ 
+ 	hlist_for_each_entry_rcu(fa, fa_head, fa_list) {
+ 		struct fib_info *next_fi = fa->fa_info;
+-		struct fib_nh_common *nhc;
+ 
+ 		if (fa->fa_slen != slen)
+ 			continue;
+@@ -2040,10 +2126,6 @@ static void fib_select_default(const struct flowi4 *flp, struct fib_result *res)
+ 		    fa->fa_type != RTN_UNICAST)
+ 			continue;
+ 
+-		nhc = fib_info_nhc(next_fi, 0);
+-		if (!nhc->nhc_gw_family || nhc->nhc_scope != RT_SCOPE_LINK)
+-			continue;
+-
+ 		fib_alias_accessed(fa);
+ 
+ 		if (!fi) {
+@@ -2051,7 +2133,8 @@ static void fib_select_default(const struct flowi4 *flp, struct fib_result *res)
+ 				break;
+ 			fa1 = fa;
+ 		} else if (!fib_detect_death(fi, order, &last_resort,
+-					     &last_idx, fa1->fa_default)) {
++					     &last_idx, fa1->fa_default,
++					     &last_nhsel, flp)) {
+ 			fib_result_assign(res, fi);
+ 			fa1->fa_default = order;
+ 			goto out;
+@@ -2061,28 +2144,39 @@ static void fib_select_default(const struct flowi4 *flp, struct fib_result *res)
+ 	}
+ 
+ 	if (order <= 0 || !fi) {
++		if (fi && fib_info_num_path(fi) > 1 &&
++		    fib_detect_death(fi, order, &last_resort, &last_idx,
++				     fa1->fa_default, &last_nhsel, flp) &&
++		    last_resort == fi) {
++			read_lock_bh(&fib_nhflags_lock);
++			fi->fib_nh[last_nhsel].fib_nh_flags &= ~RTNH_F_SUSPECT;
++			read_unlock_bh(&fib_nhflags_lock);
++		}
+ 		if (fa1)
+ 			fa1->fa_default = -1;
+ 		goto out;
+ 	}
+ 
+ 	if (!fib_detect_death(fi, order, &last_resort, &last_idx,
+-			      fa1->fa_default)) {
++			      fa1->fa_default, &last_nhsel, flp)) {
+ 		fib_result_assign(res, fi);
+ 		fa1->fa_default = order;
+ 		goto out;
+ 	}
+ 
+-	if (last_idx >= 0)
++	if (last_idx >= 0) {
+ 		fib_result_assign(res, last_resort);
++		read_lock_bh(&fib_nhflags_lock);
++		last_resort->fib_nh[last_nhsel].fib_nh_flags &= ~RTNH_F_SUSPECT;
++		read_unlock_bh(&fib_nhflags_lock);
++	}
+ 	fa1->fa_default = last_idx;
+ out:
+ 	return;
+ }
+ 
+ /*
+- * Dead device goes up. We wake up dead nexthops.
+- * It takes sense only on multipath routes.
++ * Dead device goes up or new address is added. We wake up dead nexthops.
+  *
+  * only used when fib_nh is built into fib_info
+  */
+@@ -2092,8 +2186,10 @@ int fib_sync_up(struct net_device *dev, unsigned char nh_flags)
+ 	unsigned int hash;
+ 	struct hlist_head *head;
+ 	struct fib_nh *nh;
+-	int ret;
++	struct fib_result res;
++	int ret, rep;
+ 
++repeat:
+ 	if (!(dev->flags & IFF_UP))
+ 		return 0;
+ 
+@@ -2108,6 +2204,7 @@ int fib_sync_up(struct net_device *dev, unsigned char nh_flags)
+ 	hash = fib_devindex_hashfn(dev->ifindex);
+ 	head = &fib_info_devhash[hash];
+ 	ret = 0;
++	rep = 0;
+ 
+ 	hlist_for_each_entry(nh, head, nh_hash) {
+ 		struct fib_info *fi = nh->nh_parent;
+@@ -2120,16 +2217,39 @@ int fib_sync_up(struct net_device *dev, unsigned char nh_flags)
+ 		prev_fi = fi;
+ 		alive = 0;
+ 		change_nexthops(fi) {
+-			if (!(nexthop_nh->fib_nh_flags & nh_flags)) {
+-				alive++;
++			if (!(nexthop_nh->fib_nh_flags & nh_flags))
+ 				continue;
+-			}
+ 			if (!nexthop_nh->fib_nh_dev ||
+ 			    !(nexthop_nh->fib_nh_dev->flags & IFF_UP))
+ 				continue;
+ 			if (nexthop_nh->fib_nh_dev != dev ||
+ 			    !__in_dev_get_rtnl(dev))
+ 				continue;
++			if ((nh_flags & RTNH_F_DEAD) &&
++			    nexthop_nh->fib_nh_gw4 &&
++			    nexthop_nh->fib_nh_gw_family == AF_INET &&
++			    fi->fib_protocol == RTPROT_STATIC) {
++				struct flowi4 fl4 = {
++					.daddr = nexthop_nh->fib_nh_gw4,
++					.flowi4_scope = nexthop_nh->fib_nh_scope,
++					.flowi4_oif = nexthop_nh->fib_nh_oif,
++				};
++
++				rcu_read_lock();
++				if (fib_lookup(dev_net(dev), &fl4, &res,
++					FIB_LOOKUP_IGNORE_LINKSTATE) != 0) {
++					rcu_read_unlock();
++					continue;
++				}
++				if (res.type != RTN_UNICAST &&
++				    res.type != RTN_LOCAL) {
++					rcu_read_unlock();
++					continue;
++				}
++				nexthop_nh->fib_nh_scope = res.scope;
++				rcu_read_unlock();
++				rep = 1;
++			}
+ 			alive++;
+ 			nexthop_nh->fib_nh_flags &= ~nh_flags;
+ 			call_fib_nh_notifiers(nexthop_nh, FIB_EVENT_NH_ADD);
+@@ -2142,6 +2262,8 @@ int fib_sync_up(struct net_device *dev, unsigned char nh_flags)
+ 
+ 		fib_rebalance(fi);
+ 	}
++	if (rep)
++		goto repeat;
+ 
+ 	return ret;
+ }
+@@ -2208,23 +2330,16 @@ void fib_select_multipath(struct fib_result *res, int hash)
+ void fib_select_path(struct net *net, struct fib_result *res,
+ 		     struct flowi4 *fl4, const struct sk_buff *skb)
+ {
+-	if (fl4->flowi4_oif && !(fl4->flowi4_flags & FLOWI_FLAG_SKIP_NH_OIF))
+-		goto check_saddr;
+-
++	if (res->type == RTN_UNICAST)
++		fib_select_default(fl4, res);
+ #ifdef CONFIG_IP_ROUTE_MULTIPATH
+ 	if (fib_info_num_path(res->fi) > 1) {
+ 		int h = fib_multipath_hash(net, fl4, skb, NULL);
+ 
+ 		fib_select_multipath(res, h);
+ 	}
+-	else
+ #endif
+-	if (!res->prefixlen &&
+-	    res->table->tb_num_default > 1 &&
+-	    res->type == RTN_UNICAST)
+-		fib_select_default(fl4, res);
+ 
+-check_saddr:
+ 	if (!fl4->saddr)
+ 		fl4->saddr = fib_result_prefsrc(net, res);
+ }
+diff --git a/net/ipv4/fib_trie.c b/net/ipv4/fib_trie.c
+index ffc5332f1390..43d5ed999fd9 100644
+--- a/net/ipv4/fib_trie.c
++++ b/net/ipv4/fib_trie.c
+@@ -1386,6 +1386,11 @@ bool fib_lookup_good_nhc(const struct fib_nh_common *nhc, int fib_flags,
+ 		if (flp->flowi4_oif &&
+ 		    flp->flowi4_oif != nhc->nhc_oif)
+ 			return false;
++		if (flp->fl4_gw &&
++		    flp->fl4_gw != nhc->nhc_gw.ipv4 &&
++		    nhc->nhc_gw.ipv4 &&
++		    nhc->nhc_scope == RT_SCOPE_LINK)
++			return false;
+ 	}
+ 
+ 	return true;
+diff --git a/net/ipv4/netfilter/iptable_nat.c b/net/ipv4/netfilter/iptable_nat.c
+index b0143b109f25..7ff757336fc1 100644
+--- a/net/ipv4/netfilter/iptable_nat.c
++++ b/net/ipv4/netfilter/iptable_nat.c
+@@ -40,6 +40,13 @@ static const struct nf_hook_ops nf_nat_ipv4_ops[] = {
+ 		.hooknum	= NF_INET_PRE_ROUTING,
+ 		.priority	= NF_IP_PRI_NAT_DST,
+ 	},
++	/* Before routing, route before mangling */
++	{
++		.hook		= ip_nat_route_input,
++		.pf		= NFPROTO_IPV4,
++		.hooknum	= NF_INET_PRE_ROUTING,
++		.priority	= NF_IP_PRI_LAST-1,
++	},
+ 	{
+ 		.hook		= iptable_nat_do_chain,
+ 		.pf		= NFPROTO_IPV4,
+diff --git a/net/ipv4/route.c b/net/ipv4/route.c
+index 9f43abeac3a8..8f0274432dd8 100644
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -1716,7 +1716,7 @@ int ip_mc_validate_source(struct sk_buff *skb, __be32 daddr, __be32 saddr,
+ 			return -EINVAL;
+ 	} else {
+ 		err = fib_validate_source(skb, saddr, 0, tos, 0, dev,
+-					  in_dev, itag);
++					  in_dev, itag, 1);
+ 		if (err < 0)
+ 			return err;
+ 	}
+@@ -1791,7 +1791,7 @@ static void ip_handle_martian_source(struct net_device *dev,
+ static int __mkroute_input(struct sk_buff *skb,
+ 			   const struct fib_result *res,
+ 			   struct in_device *in_dev,
+-			   __be32 daddr, __be32 saddr, u32 tos)
++			   __be32 daddr, __be32 saddr, u32 tos, __be32 lsrc)
+ {
+ 	struct fib_nh_common *nhc = FIB_RES_NHC(*res);
+ 	struct net_device *dev = nhc->nhc_dev;
+@@ -1810,7 +1810,7 @@ static int __mkroute_input(struct sk_buff *skb,
+ 	}
+ 
+ 	err = fib_validate_source(skb, saddr, daddr, tos, FIB_RES_OIF(*res),
+-				  in_dev->dev, in_dev, &itag);
++				  in_dev->dev, in_dev, &itag, 0);
+ 	if (err < 0) {
+ 		ip_handle_martian_source(in_dev->dev, in_dev, skb, daddr,
+ 					 saddr);
+@@ -1820,7 +1820,7 @@ static int __mkroute_input(struct sk_buff *skb,
+ 
+ 	do_cache = res->fi && !itag;
+ 	if (out_dev == in_dev && err && IN_DEV_TX_REDIRECTS(out_dev) &&
+-	    skb->protocol == htons(ETH_P_IP)) {
++	    skb->protocol == htons(ETH_P_IP) && !lsrc) {
+ 		__be32 gw;
+ 
+ 		gw = nhc->nhc_gw_family == AF_INET ? nhc->nhc_gw.ipv4 : 0;
+@@ -2013,10 +2013,12 @@ int fib_multipath_hash(const struct net *net, const struct flowi4 *fl4,
+ 
+ static int ip_mkroute_input(struct sk_buff *skb,
+ 			    struct fib_result *res,
++			    const struct flowi4 *fl4,
+ 			    struct in_device *in_dev,
+ 			    __be32 daddr, __be32 saddr, u32 tos,
+-			    struct flow_keys *hkeys)
++			    struct flow_keys *hkeys, __be32 lsrc)
+ {
++	fib_select_default(fl4, res);
+ #ifdef CONFIG_IP_ROUTE_MULTIPATH
+ 	if (res->fi && fib_info_num_path(res->fi) > 1) {
+ 		int h = fib_multipath_hash(res->fi->fib_net, NULL, skb, hkeys);
+@@ -2026,7 +2028,7 @@ static int ip_mkroute_input(struct sk_buff *skb,
+ #endif
+ 
+ 	/* create a routing cache entry */
+-	return __mkroute_input(skb, res, in_dev, daddr, saddr, tos);
++	return __mkroute_input(skb, res, in_dev, daddr, saddr, tos, lsrc);
+ }
+ 
+ /* Implements all the saddr-related checks as ip_route_input_slow(),
+@@ -2056,7 +2058,8 @@ int ip_route_use_hint(struct sk_buff *skb, __be32 daddr, __be32 saddr,
+ 		goto skip_validate_source;
+ 
+ 	tos &= IPTOS_RT_MASK;
+-	err = fib_validate_source(skb, saddr, daddr, tos, 0, dev, in_dev, &tag);
++	err = fib_validate_source(skb, saddr, daddr, tos, 0, dev, in_dev, &tag,
++				  0);
+ 	if (err < 0)
+ 		goto martian_source;
+ 
+@@ -2083,7 +2086,7 @@ int ip_route_use_hint(struct sk_buff *skb, __be32 daddr, __be32 saddr,
+  */
+ 
+ static int ip_route_input_slow(struct sk_buff *skb, __be32 daddr, __be32 saddr,
+-			       u8 tos, struct net_device *dev,
++			       u8 tos, struct net_device *dev, __be32 lsrc,
+ 			       struct fib_result *res)
+ {
+ 	struct in_device *in_dev = __in_dev_get_rcu(dev);
+@@ -2141,19 +2144,26 @@ static int ip_route_input_slow(struct sk_buff *skb, __be32 daddr, __be32 saddr,
+ 			goto martian_source;
+ 	}
+ 
++	if (lsrc) {
++		if (ipv4_is_multicast(lsrc) || ipv4_is_lbcast(lsrc) ||
++		    ipv4_is_zeronet(lsrc) || ipv4_is_loopback(lsrc))
++			goto martian_source;
++	}
++
+ 	/*
+ 	 *	Now we are ready to route packet.
+ 	 */
+ 	fl4.flowi4_oif = 0;
+-	fl4.flowi4_iif = dev->ifindex;
++	fl4.flowi4_iif = lsrc ? LOOPBACK_IFINDEX : dev->ifindex;
+ 	fl4.flowi4_mark = skb->mark;
+ 	fl4.flowi4_tos = tos;
+ 	fl4.flowi4_scope = RT_SCOPE_UNIVERSE;
+ 	fl4.flowi4_flags = 0;
+ 	fl4.daddr = daddr;
+-	fl4.saddr = saddr;
++	fl4.saddr = lsrc? : saddr;
+ 	fl4.flowi4_uid = sock_net_uid(net, NULL);
+ 	fl4.flowi4_multipath_hash = 0;
++	fl4.fl4_gw = 0;
+ 
+ 	if (fib4_rules_early_flow_dissect(net, skb, &fl4, &_flkeys)) {
+ 		flkeys = &_flkeys;
+@@ -2164,6 +2174,8 @@ static int ip_route_input_slow(struct sk_buff *skb, __be32 daddr, __be32 saddr,
+ 	}
+ 
+ 	err = fib_lookup(net, &fl4, res, 0);
++	fl4.flowi4_iif = dev->ifindex;
++	fl4.saddr = saddr;
+ 	if (err != 0) {
+ 		if (!IN_DEV_FORWARD(in_dev))
+ 			err = -EHOSTUNREACH;
+@@ -2181,7 +2193,7 @@ static int ip_route_input_slow(struct sk_buff *skb, __be32 daddr, __be32 saddr,
+ 
+ 	if (res->type == RTN_LOCAL) {
+ 		err = fib_validate_source(skb, saddr, daddr, tos,
+-					  0, dev, in_dev, &itag);
++					  0, dev, in_dev, &itag, 1);
+ 		if (err < 0)
+ 			goto martian_source;
+ 		goto local_input;
+@@ -2195,16 +2207,19 @@ static int ip_route_input_slow(struct sk_buff *skb, __be32 daddr, __be32 saddr,
+ 		goto martian_destination;
+ 
+ make_route:
+-	err = ip_mkroute_input(skb, res, in_dev, daddr, saddr, tos, flkeys);
++	err = ip_mkroute_input(skb, res, &fl4, in_dev, daddr, saddr, tos,
++			       flkeys, lsrc);
+ out:	return err;
+ 
+ brd_input:
+ 	if (skb->protocol != htons(ETH_P_IP))
+ 		goto e_inval;
++	if (lsrc)
++		goto e_inval;
+ 
+ 	if (!ipv4_is_zeronet(saddr)) {
+ 		err = fib_validate_source(skb, saddr, 0, tos, 0, dev,
+-					  in_dev, &itag);
++					  in_dev, &itag, 1);
+ 		if (err < 0)
+ 			goto martian_source;
+ 	}
+@@ -2307,9 +2322,26 @@ int ip_route_input_noref(struct sk_buff *skb, __be32 daddr, __be32 saddr,
+ }
+ EXPORT_SYMBOL(ip_route_input_noref);
+ 
++int ip_route_input_lookup(struct sk_buff *skb, __be32 daddr, __be32 saddr,
++			  u8 tos, struct net_device *dev, __be32 lsrc)
++{
++	struct fib_result res;
++	int err;
++
++	tos &= IPTOS_RT_MASK;
++	rcu_read_lock();
++	err = ip_route_input_common_rcu(skb, daddr, saddr, tos, dev, lsrc,
++					&res);
++	rcu_read_unlock();
++
++	return err;
++}
++EXPORT_SYMBOL(ip_route_input_lookup);
++
+ /* called with rcu_read_lock held */
+-int ip_route_input_rcu(struct sk_buff *skb, __be32 daddr, __be32 saddr,
+-		       u8 tos, struct net_device *dev, struct fib_result *res)
++int ip_route_input_common_rcu(struct sk_buff *skb, __be32 daddr, __be32 saddr,
++			      u8 tos, struct net_device *dev, __be32 lsrc,
++			      struct fib_result *res)
+ {
+ 	/* Multicast recognition logic is moved from route cache to here.
+ 	   The problem was that too many Ethernet cards have broken/missing
+@@ -2355,7 +2387,13 @@ int ip_route_input_rcu(struct sk_buff *skb, __be32 daddr, __be32 saddr,
+ 		return err;
+ 	}
+ 
+-	return ip_route_input_slow(skb, daddr, saddr, tos, dev, res);
++	return ip_route_input_slow(skb, daddr, saddr, tos, dev, lsrc, res);
++}
++
++int ip_route_input_rcu(struct sk_buff *skb, __be32 daddr, __be32 saddr,
++		       u8 tos, struct net_device *dev, struct fib_result *res)
++{
++	return ip_route_input_common_rcu(skb, daddr, saddr, tos, dev, 0, res);
+ }
+ 
+ /* called with rcu_read_lock() */
+@@ -2609,6 +2647,7 @@ struct rtable *ip_route_output_key_hash_rcu(struct net *net, struct flowi4 *fl4,
+ 			fl4->daddr = fl4->saddr = htonl(INADDR_LOOPBACK);
+ 		dev_out = net->loopback_dev;
+ 		fl4->flowi4_oif = LOOPBACK_IFINDEX;
++		fl4->fl4_gw = 0;
+ 		res->type = RTN_LOCAL;
+ 		flags |= RTCF_LOCAL;
+ 		goto make_route;
+@@ -2667,6 +2706,7 @@ struct rtable *ip_route_output_key_hash_rcu(struct net *net, struct flowi4 *fl4,
+ 		orig_oif = FIB_RES_OIF(*res);
+ 
+ 		fl4->flowi4_oif = dev_out->ifindex;
++		fl4->fl4_gw = 0;
+ 		flags |= RTCF_LOCAL;
+ 		goto make_route;
+ 	}
+diff --git a/net/netfilter/nf_nat_core.c b/net/netfilter/nf_nat_core.c
+index b7c3c902290f..4817c15b04c5 100644
+--- a/net/netfilter/nf_nat_core.c
++++ b/net/netfilter/nf_nat_core.c
+@@ -1148,6 +1148,49 @@ static struct nf_nat_hook nat_hook = {
+ 	.manip_pkt		= nf_nat_manip_pkt,
+ };
+ 
++unsigned int ip_nat_route_input(void *priv,
++				struct sk_buff *skb,
++				const struct nf_hook_state *state)
++{
++	struct iphdr *iph;
++	struct nf_conn *conn;
++	enum ip_conntrack_info ctinfo;
++	enum ip_conntrack_dir dir;
++	unsigned long statusbit;
++	__be32 saddr;
++
++	if (!(conn = nf_ct_get(skb, &ctinfo)))
++		return NF_ACCEPT;
++
++	if (!(conn->status & IPS_NAT_DONE_MASK))
++		return NF_ACCEPT;
++	dir = CTINFO2DIR(ctinfo);
++	statusbit = IPS_SRC_NAT;
++	if (dir == IP_CT_DIR_REPLY)
++		statusbit ^= IPS_NAT_MASK;
++	if (!(conn->status & statusbit))
++		return NF_ACCEPT;
++
++	if (skb_dst(skb))
++		return NF_ACCEPT;
++
++	if (skb->len < sizeof(struct iphdr))
++		return NF_ACCEPT;
++
++	/* use daddr in other direction as masquerade address (lsrc) */
++	iph = ip_hdr(skb);
++	saddr = conn->tuplehash[!dir].tuple.dst.u3.ip;
++	if (saddr == iph->saddr)
++		return NF_ACCEPT;
++
++	if (ip_route_input_lookup(skb, iph->daddr, iph->saddr, iph->tos,
++	    skb->dev, saddr))
++		return NF_DROP;
++
++	return NF_ACCEPT;
++}
++EXPORT_SYMBOL_GPL(ip_nat_route_input);
++
+ static int __init nf_nat_init(void)
+ {
+ 	int ret, i;
+diff --git a/net/netfilter/nf_nat_masquerade.c b/net/netfilter/nf_nat_masquerade.c
+index 8e8a65d46345..df1376143cd6 100644
+--- a/net/netfilter/nf_nat_masquerade.c
++++ b/net/netfilter/nf_nat_masquerade.c
+@@ -21,8 +21,8 @@ nf_nat_masquerade_ipv4(struct sk_buff *skb, unsigned int hooknum,
+ 	struct nf_conn_nat *nat;
+ 	enum ip_conntrack_info ctinfo;
+ 	struct nf_nat_range2 newrange;
+-	const struct rtable *rt;
+-	__be32 newsrc, nh;
++	struct rtable *rt;
++	__be32 newsrc;
+ 
+ 	WARN_ON(hooknum != NF_INET_POST_ROUTING);
+ 
+@@ -37,12 +37,23 @@ nf_nat_masquerade_ipv4(struct sk_buff *skb, unsigned int hooknum,
+ 	if (ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple.src.u3.ip == 0)
+ 		return NF_ACCEPT;
+ 
+-	rt = skb_rtable(skb);
+-	nh = rt_nexthop(rt, ip_hdr(skb)->daddr);
+-	newsrc = inet_select_addr(out, nh, RT_SCOPE_UNIVERSE);
+-	if (!newsrc) {
+-		pr_info("%s ate my IP address\n", out->name);
+-		return NF_DROP;
++	{
++		struct flowi4 fl4 = { .flowi4_tos = RT_TOS(ip_hdr(skb)->tos),
++				      .flowi4_mark = skb->mark,
++				      .flowi4_oif = out->ifindex,
++				      .daddr = ip_hdr(skb)->daddr,
++				      .fl4_gw = skb_rtable(skb)->rt_gw4 };
++		rt = ip_route_output_key(dev_net(out), &fl4);
++		if (IS_ERR(rt)) {
++			/* Funky routing can do this. */
++			if (net_ratelimit())
++				pr_info("%s:"
++				       " No route: Rusty's brain broke!\n",
++				       out->name);
++			return NF_DROP;
++		}
++		newsrc = fl4.saddr;
++		ip_rt_put(rt);
+ 	}
+ 
+ 	nat = nf_ct_nat_ext_add(ct);
+diff --git a/security/selinux/nlmsgtab.c b/security/selinux/nlmsgtab.c
+index b69231918686..26b1df65ea97 100644
+--- a/security/selinux/nlmsgtab.c
++++ b/security/selinux/nlmsgtab.c
+@@ -88,6 +88,9 @@ static const struct nlmsg_perm nlmsg_route_perms[] =
+ 	{ RTM_NEWVLAN,		NETLINK_ROUTE_SOCKET__NLMSG_WRITE },
+ 	{ RTM_DELVLAN,		NETLINK_ROUTE_SOCKET__NLMSG_WRITE },
+ 	{ RTM_GETVLAN,		NETLINK_ROUTE_SOCKET__NLMSG_READ  },
++	{ RTM_NEWARPRULE,	NETLINK_ROUTE_SOCKET__NLMSG_WRITE },
++	{ RTM_DELARPRULE,	NETLINK_ROUTE_SOCKET__NLMSG_WRITE },
++	{ RTM_GETARPRULE,	NETLINK_ROUTE_SOCKET__NLMSG_READ  },
+ };
+ 
+ static const struct nlmsg_perm nlmsg_tcpdiag_perms[] =
+@@ -171,7 +174,7 @@ int selinux_nlmsg_lookup(u16 sclass, u16 nlmsg_type, u32 *perm)
+ 		 * structures at the top of this file with the new mappings
+ 		 * before updating the BUILD_BUG_ON() macro!
+ 		 */
+-		BUILD_BUG_ON(RTM_MAX != (RTM_NEWVLAN + 3));
++		BUILD_BUG_ON(RTM_MAX != (RTM_NEWARPRULE + 3));
+ 		err = nlmsg_perm(nlmsg_type, perm, nlmsg_route_perms,
+ 				 sizeof(nlmsg_route_perms));
+ 		break;
